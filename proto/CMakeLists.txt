@@ -8,7 +8,8 @@ protobuf_generate_cpp(protobuff_srcs protobuff_hdrs
   fileformat.proto
   osmformat.proto
   transit.proto
-  transit_fetch.proto)
+  transit_fetch.proto
+  vector_tile.proto)
 
 valhalla_module(NAME proto
   SOURCES

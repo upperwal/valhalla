@@ -45,6 +45,7 @@ const std::unordered_map<unsigned, std::string>
                  "Insufficiently specified required parameter 'locations' or 'sources & targets'"},
                 {113, "Insufficiently specified required parameter 'contours'"},
                 {114, "Insufficiently specified required parameter 'shape' or 'encoded_polyline'"},
+                {115, "Insufficiently specified required parameter 'z' 'x' or 'y'"},
 
                 {120, "Insufficient number of locations provided"},
                 {121, "Insufficient number of sources provided"},
@@ -189,6 +190,7 @@ worker_t::result_t to_response_json(const std::string& json,
 worker_t::result_t to_response_xml(const std::string& xml,
                                    http_request_info_t& request_info,
                                    const valhalla_request_t& options);
+worker_t::result_t to_response_pbf(const std::string& binary, http_request_info_t& request_info);
 #endif
 
 class service_worker_t {

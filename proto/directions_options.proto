@@ -102,6 +102,13 @@ message CostingOptions {
   repeated string filter_route_ids = 54;
 }
 
+message TileName {
+  optional uint32 z = 1;  //the zoom level
+  optional uint32 x = 2;  //the x access index
+  optional uint32 y = 3;  //the y access index
+  //TODO: style mbvt vs valhalla?
+}
+
 message DirectionsOptions {
 
   enum Units {
@@ -125,6 +132,7 @@ message DirectionsOptions {
     trace_attributes = 10;
     height = 11;
     transit_available = 12;
+    vtiles = 13;
   }
 
   enum DateTimeType {
@@ -171,4 +179,5 @@ message DirectionsOptions {
   optional float breakage_distance = 36;                                  // Map-matching breaking distance (distance between GPS trace points)
   optional bool use_timestamps = 37;                                      // Use timestamps to compute elapsed time for trace_route and trace_attributes
   optional ShapeFormat shape_format = 38 [default = polyline6];           // Shape format (defaults to polyline6 encoding)
+  optional TileName tile_name = 39;                                       // The zxy of the slippy map tile you want
 }

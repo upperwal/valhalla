@@ -84,7 +84,7 @@ const std::unordered_map<unsigned, std::string> HTTP_STATUS_CODES{
 const std::unordered_map<unsigned, unsigned> ERROR_TO_STATUS{
     {100, 400}, {101, 405}, {106, 404}, {107, 501},
 
-    {110, 400}, {111, 400}, {112, 400}, {113, 400}, {114, 400},
+    {110, 400}, {111, 400}, {112, 400}, {113, 400}, {114, 400}, {115, 400},
 
     {120, 400}, {121, 400}, {122, 400}, {123, 400}, {124, 400}, {125, 400}, {126, 400},
 
@@ -143,6 +143,7 @@ const std::unordered_map<unsigned, std::string> OSRM_ERRORS_CODES{
     {112, R"({"code":"InvalidOptions","message":"Options are invalid."})"},
     {113, R"({"code":"InvalidOptions","message":"Options are invalid."})"},
     {114, R"({"code":"InvalidOptions","message":"Options are invalid."})"},
+    {115, R"({"code":"InvalidOptions","message":"Options are invalid."})"},
 
     {120, R"({"code":"InvalidOptions","message":"Options are invalid."})"},
     {121, R"({"code":"InvalidOptions","message":"Options are invalid."})"},
@@ -815,6 +816,16 @@ void from_json(rapidjson::Document& doc, odin::DirectionsOptions& options) {
   doc.AddMember({"format", allocator},
                 {valhalla::odin::DirectionsOptions_Format_Name(options.format()), allocator},
                 allocator);
+
+  auto coord = rapidjson::get_optional<uint32_t>(doc, "z");
+  if (coord)
+    options.mutable_tile_name()->set_z(*coord);
+  coord = rapidjson::get_optional<uint32_t>(doc, "x");
+  if (coord)
+    options.mutable_tile_name()->set_x(*coord);
+  coord = rapidjson::get_optional<uint32_t>(doc, "y");
+  if (coord)
+    options.mutable_tile_name()->set_y(*coord);
 }
 
 } // namespace
@@ -833,6 +844,7 @@ bool DirectionsOptions_Action_Parse(const std::string& action, odin::DirectionsO
       {"trace_attributes", odin::DirectionsOptions::trace_attributes},
       {"height", odin::DirectionsOptions::height},
       {"transit_available", odin::DirectionsOptions::transit_available},
+      {"vtiles", odin::DirectionsOptions::vtiles},
   };
   auto i = actions.find(action);
   if (i == actions.cend())
@@ -1087,6 +1099,7 @@ const headers_t::value_type JSON_MIME{"Content-type", "application/json;charset=
 const headers_t::value_type JS_MIME{"Content-type", "application/javascript;charset=utf-8"};
 const headers_t::value_type XML_MIME{"Content-type", "text/xml;charset=utf-8"};
 const headers_t::value_type GPX_MIME{"Content-type", "application/gpx+xml;charset=utf-8"};
+const headers_t::value_type PBF_MIME{"Content-type", "application/x-protobuf"};
 const headers_t::value_type ATTACHMENT{"Content-Disposition", "attachment; filename=route.gpx"};
 
 worker_t::result_t jsonify_error(const valhalla_exception_t& exception,
@@ -1192,6 +1205,14 @@ worker_t::result_t to_response_xml(const std::string& xml,
                                    const valhalla_request_t& request) {
   worker_t::result_t result{false};
   http_response_t response(200, "OK", xml, headers_t{CORS, GPX_MIME, ATTACHMENT});
+  response.from_info(request_info);
+  result.messages.emplace_back(response.to_string());
+  return result;
+}
+
+worker_t::result_t to_response_pbf(const std::string& binary, http_request_info_t& request_info) {
+  worker_t::result_t result{false};
+  http_response_t response(200, "OK", binary, headers_t{CORS, PBF_MIME});
   response.from_info(request_info);
   result.messages.emplace_back(response.to_string());
   return result;

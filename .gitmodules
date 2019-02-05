@@ -13,3 +13,6 @@
 [submodule "third_party/date"]
 	path = third_party/date
 	url = https://github.com/HowardHinnant/date.git
+[submodule "third_party/vector-tile-spec"]
+	path = third_party/vector-tile-spec
+	url = https://github.com/mapbox/vector-tile-spec.git

@@ -286,6 +286,9 @@ worker_t::result_t loki_worker_t::work(const std::list<zmq::message_t>& job,
       case odin::DirectionsOptions::transit_available:
         result = to_response_json(transit_available(request), info, request);
         break;
+      case odin::DirectionsOptions::vtiles:
+        result = to_response_pbf(vtile(request), info);
+        break;
       default:
         // apparently you wanted something that we figured we'd support but havent written yet
         return jsonify_error({107}, info, request);
