@@ -826,6 +826,11 @@ void from_json(rapidjson::Document& doc, odin::DirectionsOptions& options) {
   coord = rapidjson::get_optional<uint32_t>(doc, "y");
   if (coord)
     options.mutable_tile_name()->set_y(*coord);
+  auto style_str = rapidjson::get_optional<std::string>(doc, "/style");
+  odin::Style style;
+  if (style_str && odin::Style_Parse(*style_str, &style)) {
+    options.mutable_tile_name()->set_style(style);
+  }
 }
 
 } // namespace
@@ -844,7 +849,7 @@ bool DirectionsOptions_Action_Parse(const std::string& action, odin::DirectionsO
       {"trace_attributes", odin::DirectionsOptions::trace_attributes},
       {"height", odin::DirectionsOptions::height},
       {"transit_available", odin::DirectionsOptions::transit_available},
-      {"vtiles", odin::DirectionsOptions::vtiles},
+      {"tile", odin::DirectionsOptions::tile},
   };
   auto i = actions.find(action);
   if (i == actions.cend())
@@ -865,6 +870,7 @@ const std::string& DirectionsOptions_Action_Name(const odin::DirectionsOptions::
       {odin::DirectionsOptions::trace_attributes, "trace_attributes"},
       {odin::DirectionsOptions::height, "height"},
       {odin::DirectionsOptions::transit_available, "transit_available"},
+      {odin::DirectionsOptions::tile, "tile"},
   };
   auto i = actions.find(action);
   return i == actions.cend() ? empty : i->second;
@@ -1002,6 +1008,19 @@ bool DirectionsType_Parse(const std::string& dtype, odin::DirectionsType* t) {
   if (i == types.cend())
     return false;
   *t = i->second;
+  return true;
+}
+
+bool Style_Parse(const std::string& style, odin::Style* s) {
+  static const std::unordered_map<std::string, odin::Style> styles{
+      {"debug", odin::Style::debug},
+      //{"display", odin::DirectionsType::display},
+      //{"valhalla", odin::DirectionsType::valhalla},
+  };
+  auto i = styles.find(style);
+  if (i == styles.cend())
+    return false;
+  *s = i->second;
   return true;
 }
 } // namespace odin

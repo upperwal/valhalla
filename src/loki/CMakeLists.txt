@@ -10,7 +10,7 @@ set(sources
   isochrone_action.cc
   trace_route_action.cc
   transit_available_action.cc
-  vtile_action.cc
+  tile_action.cc
   node_search.cc)
 
 valhalla_module(NAME loki

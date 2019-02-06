@@ -43,7 +43,7 @@ public:
   void isochrones(valhalla_request_t& request);
   void trace(valhalla_request_t& request);
   std::string height(valhalla_request_t& request);
-  std::string vtile(valhalla_request_t& request);
+  std::string tile(valhalla_request_t& request);
   std::string transit_available(valhalla_request_t& request);
 
 protected:

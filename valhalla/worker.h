@@ -30,6 +30,7 @@ const std::string& DirectionsOptions_Units_Name(const odin::DirectionsOptions::U
 bool FilterAction_Parse(const std::string& action, odin::FilterAction* a);
 const std::string& FilterAction_Name(const odin::FilterAction action);
 bool DirectionsType_Parse(const std::string& dtype, odin::DirectionsType* t);
+bool Style_Parse(const std::string& style, odin::Style* s);
 } // namespace odin
 
 const std::unordered_map<unsigned, std::string>
@@ -45,7 +46,7 @@ const std::unordered_map<unsigned, std::string>
                  "Insufficiently specified required parameter 'locations' or 'sources & targets'"},
                 {113, "Insufficiently specified required parameter 'contours'"},
                 {114, "Insufficiently specified required parameter 'shape' or 'encoded_polyline'"},
-                {115, "Insufficiently specified required parameter 'z' 'x' or 'y'"},
+                {115, "Insufficiently specified required parameter 'z' 'x' 'y' or 'style'"},
 
                 {120, "Insufficient number of locations provided"},
                 {121, "Insufficient number of sources provided"},
