@@ -126,6 +126,12 @@ public:
   bool roundabout() const;
   void set_roundabout(bool roundabout);
 
+  bool roundabout_clockwise() const;
+  void set_roundabout_clockwise(bool roundabout_clockwise);
+
+  std::vector<uint32_t> roundabout_exit_angles() const;
+  void set_roundabout_exit_angles(std::vector<uint32_t> roundabout_edges_length);
+
   bool portions_toll() const;
   void set_portions_toll(bool portionsToll);
 
@@ -303,6 +309,7 @@ protected:
   bool ferry_;
   bool rail_ferry_;
   bool roundabout_;
+  bool roundabout_clockwise_;
   bool portions_toll_;
   bool portions_unpaved_;
   bool portions_highway_;
@@ -356,6 +363,8 @@ protected:
   TripPath_TransitType transit_type_;
 
   std::unique_ptr<VerbalTextFormatter> verbal_formatter_;
+
+  std::vector<uint32_t> roundabout_exit_angles_;
 };
 
 } // namespace odin
