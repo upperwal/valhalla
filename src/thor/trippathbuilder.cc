@@ -484,8 +484,12 @@ inline bool IsEdgeUnique(std::set<uint64_t> roundabout_edges, const GraphId& edg
   return roundabout_edges.find(edge.value) == roundabout_edges.end();
 }
 
-const DirectedEdge* find_next_roundabout_edge(GraphReader& graphreader, GraphId& node, const NodeInfo* nodeinfo,
-    const GraphTile* tile, std::set<uint64_t>& roundabout_edges, const uint32_t pred_opp_local_index) {
+const DirectedEdge* find_next_roundabout_edge(GraphReader& graphreader,
+                                              GraphId& node,
+                                              const NodeInfo* nodeinfo,
+                                              const GraphTile* tile,
+                                              std::set<uint64_t>& roundabout_edges,
+                                              const uint32_t pred_opp_local_index) {
   GraphId edgeid(node.tileid(), node.level(), nodeinfo->edge_index());
   for (int i = 0; i < nodeinfo->edge_count(); ++i, ++edgeid) {
     auto edge = tile->directededge(edgeid);
@@ -574,7 +578,8 @@ std::vector<uint32_t> get_roundabout_exits(const GraphId& edge,
     }
 
     // Go through the directed edges - find the next roundabout edge.
-    roundabout_edge = find_next_roundabout_edge(graphreader, endnode, nodeinfo, tile, roundabout_edges, pred_opp_local_index);
+    roundabout_edge = find_next_roundabout_edge(graphreader, endnode, nodeinfo, tile,
+                                                roundabout_edges, pred_opp_local_index);
 
     // No more roundabout edges, add length to the last exit and break out of loop
     if (!roundabout_edge) {
@@ -1154,7 +1159,8 @@ TripPathBuilder::Build(const AttributesController& controller,
 
     // Roundabouts. If this edge is the first edge on this roundabout we find all exits to
     // the roundabout and use these to set the roundabout exit angles
-    trip_edge->set_unique_roundabout_edge(directededge->roundabout() && IsRoundaboutExit(node, graphtile, graphreader));
+    trip_edge->set_unique_roundabout_edge(directededge->roundabout() &&
+                                          IsRoundaboutExit(node, graphtile, graphreader));
     if (directededge->roundabout() && IsEdgeUnique(roundabout_edges, edge)) {
       roundabout_edges.insert(edge);
 
