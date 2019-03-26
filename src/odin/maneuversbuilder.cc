@@ -968,7 +968,7 @@ void ManeuversBuilder::UpdateManeuver(Maneuver& maneuver, int node_index) {
 
     maneuver.set_roundabout_clockwise(!prev_edge->drive_on_right());
 
-    if (prev_edge->unique_roundabout_edge()) {
+    if (prev_edge->roundabout_exit()) {
       maneuver.set_roundabout_exit_count(maneuver.roundabout_exit_count() + 1);
     }
 

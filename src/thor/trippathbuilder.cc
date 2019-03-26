@@ -455,60 +455,43 @@ bool all_roundabouts(const NodeInfo* nodeinfo, const GraphTile* tile) {
 }
 
 /**
- * Is this a valid roundabout edge. A roundabout exit must include a connection to
- * an edge that is not a roundabout.
- * NOTE-do we want to include/exclude sidewalks and footways?
+ * Is this a valid roundabout exit. The edge Id must be in the map and the bearing must be > 0.
  */
-bool IsRoundaboutExit(const NodeInfo* nodeinfo, const GraphTile* tile, GraphReader& graphreader) {
-  if (!all_roundabouts(nodeinfo, tile)) {
-    return true;
-  }
-
-  // Follow transition edges
-  if (nodeinfo->transition_count() > 0) {
-    const NodeTransition* trans = tile->transition(nodeinfo->transition_index());
-    for (uint32_t i = 0; i < nodeinfo->transition_count(); ++i, ++trans) {
-      GraphId endnode = trans->endnode();
-      const GraphTile* endnodetile = graphreader.GetGraphTile(endnode);
-      const NodeInfo* endnodeinfo = endnodetile->node(endnode);
-      if (!all_roundabouts(endnodeinfo, endnodetile)) {
-        return true;
-      }
-    }
-  }
-  return false;
+bool is_roundabout_exit(const GraphId& edge,
+                        const std::unordered_map<GraphId, int32_t>& roundabout_edges) {
+  auto r = roundabout_edges.find(edge);
+  return (r == roundabout_edges.end()) ? false : r->second >= 0;
 }
 
-// has this roundabout edge been encountered?
-inline bool IsEdgeUnique(std::set<uint64_t> roundabout_edges, const GraphId& edge) {
-  return roundabout_edges.find(edge.value) == roundabout_edges.end();
-}
-
-const DirectedEdge* find_next_roundabout_edge(GraphReader& graphreader,
-                                              GraphId& node,
-                                              const NodeInfo* nodeinfo,
-                                              const GraphTile* tile,
-                                              std::set<uint64_t>& roundabout_edges,
-                                              const uint32_t pred_opp_local_index) {
+// Get the GraphId of the next roundabout edge. Return other outbound edge Ids that are not
+// roundabouts.
+GraphId get_next_roundabout_edge(GraphReader& graphreader,
+                                 const DirectedEdge* directededge,
+                                 std::vector<GraphId>& other_edges) {
+  // Expand from the end node of the current roundabout edge. Skip Uturn edges (the opposing
+  // roundabout edge).
+  GraphId next_roundabout_edge;
+  GraphId node = directededge->endnode();
+  const GraphTile* tile = graphreader.GetGraphTile(node);
+  const NodeInfo* nodeinfo = tile->node(node);
   GraphId edgeid(node.tileid(), node.level(), nodeinfo->edge_index());
   for (int i = 0; i < nodeinfo->edge_count(); ++i, ++edgeid) {
     auto edge = tile->directededge(edgeid);
-
-    // Exclude Uturn edge
-    if (pred_opp_local_index == edge->localedgeidx()) {
+    if (directededge->opp_local_idx() == edge->localedgeidx()) {
       continue;
     }
 
-    // If the edge is a roundabout and if it is unique then we would set that edge as
-    // the next roundabout edge and leave the for loop. If we have encountered the edge
-    // before then it is not unique
-    if (edge->roundabout() && IsEdgeUnique(roundabout_edges, edgeid)) {
-      roundabout_edges.insert(edgeid);
-      return edge;
+    // If this is a roundabout edge store it as the next roundabout. Otherwise store the edge Id in
+    // the other_edges list
+    if (edge->roundabout()) {
+      next_roundabout_edge = edgeid;
+    } else {
+      other_edges.push_back(edgeid);
     }
   }
 
-  // Follow transition edges
+  // Follow transition edges. Do not have to worry about Uturns - the opposing roundabout edge
+  // would be on the same level as the previous roundabout edge so will not occur after a transition.
   if (nodeinfo->transition_count() > 0) {
     const NodeTransition* trans = tile->transition(nodeinfo->transition_index());
     for (uint32_t i = 0; i < nodeinfo->transition_count(); ++i, ++trans) {
@@ -517,80 +500,108 @@ const DirectedEdge* find_next_roundabout_edge(GraphReader& graphreader,
       const NodeInfo* endnodeinfo = endnodetile->node(endnode);
       edgeid = {endnode.tileid(), endnode.level(), endnodeinfo->edge_index()};
       for (int i = 0; i < endnodeinfo->edge_count(); ++i, ++edgeid) {
-        auto edge = tile->directededge(edgeid);
-
-        // Exclude Uturn edge
-        if (pred_opp_local_index == edge->localedgeidx()) {
-          continue;
-        }
-
-        // If the edge is a roundabout and if it is unique then we would set that edge as
-        // the next roundabout edge and leave the for loop. If we have encountered the edge
-        // before then it is not unique
-        if (edge->roundabout() && IsEdgeUnique(roundabout_edges, edgeid)) {
-          roundabout_edges.insert(edgeid);
-          return edge;
+        // If this is a roundabout edge store it as the next roundabout. Otherwise store the
+        // edge Id in the list
+        if (tile->directededge(edgeid)->roundabout()) {
+          next_roundabout_edge = edgeid;
+        } else {
+          other_edges.push_back(edgeid);
         }
       }
     }
   }
-  return nullptr;
+  return next_roundabout_edge;
 }
 
-/**
- * Get the lengths to each exit of a roundabout.
- */
-std::vector<uint32_t> get_roundabout_exits(const GraphId& edge,
-                                           const DirectedEdge* directededge,
-                                           GraphReader& graphreader,
-                                           std::set<uint64_t>& roundabout_edges) {
-  // Create vector of lengths between roundabout exits
-  std::vector<uint32_t> roundabout_exit_length;
+// Walk all edges of the roundabout. Adds information to the roundabout_edges map (includes
+// the GraphId of all roundabout edges) and the length to each exit (will be negative if there
+// is no exit at the end of the roundabout edge). Returns the bearings to all exits of the
+// roundabout.
+std::vector<int32_t> get_roundabout_info(const GraphId& edge,
+                                         const DirectedEdge* directededge,
+                                         GraphReader& graphreader,
+                                         std::unordered_map<GraphId, int32_t>& roundabout_edges) {
+  float total_length = directededge->length();
 
-  //   \___
-  //  _/   \_
-  // A \___/
-  //       \B
-  // Consider this roundabout, where the path within the roundabout is from A to B
-  // to get the missing roundabout exits which will not be passed around
-  // the algorithm must iterate through each edge for each node within the roundabout
-  // until it has reached the first edge of the roundabout
-  // This will be done by going through each edge and finding its
-  // end node, which will then be used to find the adjacent edge,
-  // and repeat until you have found all the edges
+  // TODO - if walking need to alter the logic since you can walk inbound (driveable) edges first
 
-  uint32_t length = 0;
-  uint32_t pred_opp_local_index = directededge->opp_local_idx();
-  auto roundabout_edge = directededge;
+  // Walk the roundabout until the first roundabout edge is reached.
+  GraphId prior_exit;
+  uint32_t prior_oneway = 0; // 1 = inbound, 2 = outbound, 3 = both ways
+  GraphId first_edge = edge;
+  const DirectedEdge* roundabout_edge = directededge;
   while (true) {
-    // Add the length of this roundabout edge
-    length += roundabout_edge->length();
+    // Get next roundabout edge and other edges at the end node of the roundabout edge
+    std::vector<GraphId> other_edges;
+    GraphId next_edge = get_next_roundabout_edge(graphreader, roundabout_edge, other_edges);
 
-    // Get the nodeinfo at the endnode of the roundabout_edge
-    GraphId endnode = roundabout_edge->endnode();
-    const GraphTile* tile = graphreader.GetGraphTile(endnode);
-    const NodeInfo* nodeinfo = tile->node(endnode);
-
-    // If this is an exit of the roundabout add the length since the last exit.
-    if (IsRoundaboutExit(nodeinfo, tile, graphreader)) {
-      roundabout_exit_length.push_back(length);
-      length = 0;
+    // Analyze other edges. Create inbound/outbound driveability
+    uint32_t oneway = 0;
+    for (const auto& e : other_edges) {
+      const DirectedEdge* other_edge = graphreader.directededge(e);
+      if ((other_edge->forwardaccess() & kAutoAccess)) {
+        oneway |= 2;
+      }
+      if ((other_edge->reverseaccess() & kAutoAccess)) {
+        oneway |= 1;
+      }
     }
 
-    // Go through the directed edges - find the next roundabout edge.
-    roundabout_edge = find_next_roundabout_edge(graphreader, endnode, nodeinfo, tile,
-                                                roundabout_edges, pred_opp_local_index);
+    // If this is an exit (outbound driveability) store its total length in the map
+    if (oneway > 1) {
+      roundabout_edges[next_edge] = total_length;
+    } else {
+      roundabout_edges[next_edge] = -1;
+    }
 
-    // No more roundabout edges, add length to the last exit and break out of loop
-    if (!roundabout_edge) {
-      if (length > 0) {
-        roundabout_exit_length.push_back(length);
+    // If this edge has an exit or entrance (or both) possibly update the length to
+    // the prior exit (to be halfway between current and prior total length.
+    // Also update prior_exit_oneway.
+    if (oneway > 0) {
+      if (prior_oneway == 2 && oneway != 2) {
+        auto exit = roundabout_edges.find(prior_exit);
+        if (exit != roundabout_edges.end()) {
+          exit->second = (exit->second + total_length) / 2;
+        }
       }
+      prior_oneway = oneway;
+    }
+
+    // Break out of loop once we find the initial roundabout edge
+    // Try breaking out if any duplicate edge is reached...
+    if (next_edge == first_edge ||
+        roundabout_edges.find(next_edge) != roundabout_edges.end()) {
       break;
     }
-    pred_opp_local_index = roundabout_edge->opp_local_idx();
+
+    // Set the next edge to be the current roundabout edge and increment length
+    roundabout_edge = graphreader.directededge(next_edge);
+    total_length += roundabout_edge->length();
+
+    // Save the prior exit
+    if (oneway > 1) {
+      prior_exit = next_edge;
+    }
   }
-  return roundabout_exit_length;
+
+  std::vector<int32_t> exit_bearings;
+  for (const auto& r : roundabout_edges) {
+    if (r.second > 0) {
+      exit_bearings.push_back(static_cast<float>(r.second) * 360.0f / total_length);
+    }
+  }
+  std::sort(exit_bearings.begin(), exit_bearings.end());
+
+  // If the last other edge (this should be the entrance to the oneway) is oneway inbound,
+  // adjust bearings by the difference between 360 and the last bearing. This makes the
+  // entering bearing 0 (shown as the last exit == 360).
+  if (prior_oneway == 1) {
+    int32_t delta = (360 - exit_bearings.back());
+    for (auto& exit : exit_bearings) {
+      exit += delta;
+    }
+  }
+  return exit_bearings;
 }
 
 } // namespace
@@ -921,7 +932,7 @@ TripPathBuilder::Build(const AttributesController& controller,
   uint64_t osmchangeset = 0;
   size_t edge_index = 0;
   const DirectedEdge* prev_de = nullptr;
-  std::set<uint64_t> roundabout_edges;
+  std::unordered_map<GraphId, int32_t> roundabout_edges;
   // TODO: this is temp until we use transit stop type from transitland
   TransitPlatformInfo_Type prev_transit_node_type = TransitPlatformInfo_Type_kStop;
   for (auto edge_itr = path.begin(); edge_itr != path.end(); ++edge_itr, ++edge_index) {
@@ -1157,31 +1168,25 @@ TripPathBuilder::Build(const AttributesController& controller,
         AddTripEdge(controller, edge, trip_id, block_id, mode, travel_type, directededge,
                     node->drive_on_right(), trip_node, graphtile, current_time, length_pct);
 
-    // Roundabouts. If this edge is the first edge on this roundabout we find all exits to
-    // the roundabout and use these to set the roundabout exit angles
-    trip_edge->set_unique_roundabout_edge(directededge->roundabout() &&
-                                          IsRoundaboutExit(node, graphtile, graphreader));
-    if (directededge->roundabout() && IsEdgeUnique(roundabout_edges, edge)) {
-      roundabout_edges.insert(edge);
-
-      // Get the lengths along the roundabout to each exit
-      auto exit_lengths = get_roundabout_exits(edge, directededge, graphreader, roundabout_edges);
-
-      // Get the total roundabout length
-      uint32_t total_length = 0;
-      for (auto length : exit_lengths) {
-        total_length += length;
-      }
-
-      if (total_length > 0) {
-        // Creating the angles for all the edges within a roundabout
-        uint32_t accumulated_length = 0;
-        for (auto exit_length : exit_lengths) {
-          accumulated_length += exit_length;
-          float angle = (static_cast<float>(accumulated_length) / total_length) * 360.0f;
-          trip_edge->add_roundabout_exit_angles(angle);
+    // Roundabouts
+    if (directededge->roundabout()) {
+      if (roundabout_edges.size() == 0) {
+        // If this is the first roundabout edge, form roundabout info (list of roundabout edges and
+        // their exit bearing (-1 if the roundabout edge does not lead to an exit).
+        std::vector<int32_t> exit_bearings =
+            get_roundabout_info(edge, directededge, graphreader, roundabout_edges);
+        for (auto b : exit_bearings) {
+          trip_edge->add_roundabout_exit_angles(b);
         }
+        trip_edge->set_roundabout_exit(true);
+      } else {
+        // Mark this edge as a roundabout exit if it is in the list of roundabout "exit" edges.
+        trip_edge->set_roundabout_exit(is_roundabout_exit(edge, roundabout_edges));
       }
+    } else {
+      // Not a roundabout edge, clear the roundabout info
+      trip_edge->set_roundabout_exit(false);
+      roundabout_edges.clear();
     }
 
     // Get the shape and set shape indexes (directed edge forward flag

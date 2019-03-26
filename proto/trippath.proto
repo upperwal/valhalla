@@ -214,7 +214,7 @@ message TripPath {
     optional int32 mean_elevation = 40;
     repeated TrafficSegment traffic_segment = 41;
     repeated uint32 roundabout_exit_angles = 42;
-    optional bool unique_roundabout_edge = 43;
+    optional bool roundabout_exit = 43;
   }
 
   message IntersectingEdge {
