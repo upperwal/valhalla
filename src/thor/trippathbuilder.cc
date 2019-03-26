@@ -569,8 +569,7 @@ std::vector<int32_t> get_roundabout_info(const GraphId& edge,
 
     // Break out of loop once we find the initial roundabout edge
     // Try breaking out if any duplicate edge is reached...
-    if (next_edge == first_edge ||
-        roundabout_edges.find(next_edge) != roundabout_edges.end()) {
+    if (next_edge == first_edge || roundabout_edges.find(next_edge) != roundabout_edges.end()) {
       break;
     }
 
