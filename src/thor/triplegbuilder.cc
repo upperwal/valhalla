@@ -1577,6 +1577,10 @@ TripLeg_Edge* TripLegBuilder::AddTripEdge(const AttributesController& controller
     trip_edge->set_truck_route(true);
   }
 
+  if (directededge->traffic_signal() && controller.attributes.at(kEdgeTrafficSignal)) {
+    trip_edge->set_traffic_signal(true);
+  }
+
   /////////////////////////////////////////////////////////////////////////////
   // Process transit information
   if (trip_id && (directededge->use() == Use::kRail || directededge->use() == Use::kBus)) {

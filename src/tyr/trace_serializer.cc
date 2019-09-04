@@ -62,6 +62,9 @@ json::ArrayPtr serialize_edges(const AttributesController& controller,
 
       // Process each edge
       auto edge_map = json::map({});
+      if(edge.has_traffic_signal()) {
+        edge_map->emplace("traffic_signal", static_cast<bool>(edge.traffic_signal()));
+      }
       if (edge.has_truck_route()) {
         edge_map->emplace("truck_route", static_cast<bool>(edge.truck_route()));
       }
