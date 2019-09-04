@@ -177,6 +177,12 @@ void ConstructEdges(const OSMData& osmdata,
       // If its an intersection or the end of the way it's a node of the road network graph
       if (way_node.node.intersection()) {
 
+        if (way_node.node.traffic_signal()) {
+          edge.attributes.traffic_signal = true;
+          edge.attributes.forward_signal = way_node.node.forward_signal();
+          edge.attributes.backward_signal = way_node.node.backward_signal();
+        }
+
         // Finish off this edge
         edge.attributes.shortlink =
             (way.link() && Length(edge.llindex_, way_node.node) < kMaxInternalLength);
