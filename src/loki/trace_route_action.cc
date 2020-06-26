@@ -40,15 +40,32 @@ void check_shape(const google::protobuf::RepeatedPtrField<valhalla::Location>& s
 
 void check_distance(const google::protobuf::RepeatedPtrField<valhalla::Location>& shape,
                     float max_distance,
+                    float max_breakage_distance,
                     float max_factor = 1.0f) {
+
   // Adjust max - this enables max edge_walk distance to be larger
   max_distance *= max_factor;
 
-  // Calculate "crow distance" of shape
-  auto crow_distance = to_ll(*shape.begin()).Distance(to_ll(*shape.rbegin()));
+  bool can_be_matched = false;
+  float crow_distance = 0.f;
+  for (auto iter = shape.begin(); iter < shape.end() - 1; ++iter) {
+    // We bail when the distance between two locations exceeds the threshold
+    PointLL curr_point = to_ll(*iter);
+    PointLL next_point = to_ll(*std::next(iter));
+    float point_to_point_distance = curr_point.Distance(next_point);
+    crow_distance += point_to_point_distance;
 
-  if (crow_distance > max_distance) {
-    throw valhalla_exception_t{154};
+    if (point_to_point_distance <= max_breakage_distance) {
+      can_be_matched = true;
+    }
+
+    if (crow_distance > max_distance) {
+      throw valhalla_exception_t{154};
+    }
+  }
+
+  if (!can_be_matched) {
+    throw valhalla_exception_t{172, " " + std::to_string(max_breakage_distance) + " meters"};
   }
 
   valhalla::midgard::logging::Log("location_distance::" +
@@ -130,7 +147,9 @@ void loki_worker_t::init_trace(Api& request) {
 
   // Validate shape count and distance (for now, just send max_factor for distance)
   check_shape(options.shape(), max_trace_shape);
-  check_distance(options.shape(), max_distance.find("trace")->second, max_factor);
+  float breakage_distance =
+      options.has_breakage_distance() ? options.breakage_distance() : default_breakage_distance;
+  check_distance(options.shape(), max_distance.find("trace")->second, breakage_distance, max_factor);
 
   // Validate best paths and best paths shape for `map_snap` requests
   if (options.shape_match() == ShapeMatch::map_snap) {
@@ -155,9 +174,9 @@ void loki_worker_t::init_trace(Api& request) {
 
 void loki_worker_t::trace(Api& request) {
   init_trace(request);
-  auto costing = Costing_Name(request.options().costing());
+  const auto& costing = Costing_Enum_Name(request.options().costing());
   if (costing == "multimodal") {
-    throw valhalla_exception_t{140, Options_Action_Name(request.options().action())};
+    throw valhalla_exception_t{140, Options_Action_Enum_Name(request.options().action())};
   };
 }
 
@@ -184,7 +203,7 @@ void loki_worker_t::locations_from_shape(Api& request) {
 
     // Project first and last shape point onto nearest edge(s). Clear current locations list
     // and set the path locations
-    auto projections = loki::Search(locations, *reader, edge_filter, node_filter);
+    auto projections = loki::Search(locations, *reader, costing);
     options.clear_locations();
     PathLocation::toPBF(projections.at(locations.front()), options.mutable_locations()->Add(),
                         *reader);

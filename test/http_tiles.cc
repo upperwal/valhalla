@@ -1,126 +1,26 @@
 #include "test.h"
 
-#include <prime_server/http_protocol.hpp>
-#include <prime_server/http_util.hpp>
+#include "baldr/curl_tilegetter.h"
+#include "baldr/graphtile.h"
+#include "baldr/rapidjson_utils.h"
+#include "tyr/actor.h"
+#include "valhalla/filesystem.h"
+#include "valhalla/tile_server.h"
+
 #include <prime_server/prime_server.hpp>
 
 #include <boost/property_tree/ptree.hpp>
 
-#include <chrono>
-#include <csignal>
-#include <functional>
+#include <ostream>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
-#include "baldr/compression_utils.h"
-#include "baldr/rapidjson_utils.h"
-#include "filesystem.h"
-#include "tyr/actor.h"
-
-using namespace prime_server;
 using namespace valhalla;
 
-std::string gzip(std::string& uncompressed) {
-  auto deflate_src = [&uncompressed](z_stream& s) {
-    s.next_in = static_cast<Byte*>(static_cast<void*>(&uncompressed[0]));
-    s.avail_in = static_cast<unsigned int>(uncompressed.size() * sizeof(std::string::value_type));
-    return Z_FINISH;
-  };
-
-  std::string compressed;
-  auto deflate_dst = [&compressed](z_stream& s) {
-    // if the whole buffer wasn't used we are done
-    auto size = compressed.size();
-    if (s.total_out < size)
-      compressed.resize(s.total_out);
-    // we need more space
-    else {
-      // set the pointer to the next spot
-      compressed.resize(size + 16);
-      s.next_out = static_cast<Byte*>(static_cast<void*>(&compressed[0] + size));
-      s.avail_out = 16;
-    }
-  };
-
-  if (!baldr::deflate(deflate_src, deflate_dst))
-    throw std::logic_error("Can't write gzipped string");
-
-  return compressed;
-}
-
-worker_t::result_t
-disk_work(const std::list<zmq::message_t>& job, void* request_info, worker_t::interrupt_function_t&) {
-  worker_t::result_t result{false};
-  auto* info = static_cast<http_request_info_t*>(request_info);
-  try {
-    // parse request
-    const auto request =
-        http_request_t::from_string(static_cast<const char*>(job.front().data()), job.front().size());
-
-    // ends with gz
-    auto path = request.path;
-    auto gz = path.find(".gz");
-    if (gz == path.size() - 3)
-      path = path.substr(0, gz);
-    else
-      gz = 0;
-
-    // load the file and gzip it if we have to
-    std::string full_path =
-        "test/data/utrecht_tiles" + (filesystem::path::preferred_separator + path);
-    std::fstream input(full_path, std::ios::in | std::ios::binary);
-    if (input) {
-      std::string buffer((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-      if (gz)
-        buffer = gzip(buffer);
-      http_response_t response(200, "OK", buffer,
-                               headers_t{{"Content-Encoding", gz ? "gzip" : "identity"}});
-      response.from_info(*info);
-      result.messages = {response.to_string()};
-    }
-  } catch (const std::exception& e) {
-    http_response_t response(400, "Bad Request", e.what());
-    response.from_info(*static_cast<http_request_info_t*>(request_info));
-    result.messages = {response.to_string()};
-  }
-
-  // 404 if its not there
-  if (result.messages.empty()) {
-    http_response_t response(404, "Not Found", "Not Found");
-    response.from_info(*info);
-    result.messages = {response.to_string()};
-  }
-  return result;
-}
-
 zmq::context_t context;
-void start_server() {
-  // change these to tcp://known.ip.address.with:port if you want to do this across machines
-  std::string result_endpoint = "ipc:///tmp/http_test_result_endpoint";
-  std::string request_interrupt = "ipc:///tmp/http_test_request_interrupt";
-  std::string proxy_endpoint = "ipc:///tmp/http_test_proxy_endpoint";
-
-  // server
-  std::thread server(std::bind(&http_server_t::serve,
-                               http_server_t(context, "tcp://*:8004", proxy_endpoint + "_upstream",
-                                             result_endpoint, request_interrupt, false)));
-  server.detach();
-
-  // load balancer for file serving
-  std::thread file_proxy(std::bind(&proxy_t::forward, proxy_t(context, proxy_endpoint + "_upstream",
-                                                              proxy_endpoint + "_downstream")));
-  file_proxy.detach();
-
-  // file serving thread
-  std::thread file_worker(
-      std::bind(&worker_t::work, worker_t(context, proxy_endpoint + "_downstream", "ipc:///dev/null",
-                                          result_endpoint, request_interrupt,
-                                          std::bind(&disk_work, std::placeholders::_1,
-                                                    std::placeholders::_2, std::placeholders::_3))));
-  file_worker.detach();
-
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-}
 
 boost::property_tree::ptree json_to_pt(const std::string& json) {
   std::stringstream ss;
@@ -130,14 +30,25 @@ boost::property_tree::ptree json_to_pt(const std::string& json) {
   return pt;
 }
 
-boost::property_tree::ptree make_conf(const std::string& tile_dir, bool tile_url_gz) {
+std::string get_tile_url() {
+  std::ostringstream oss;
+  oss << test_tile_server_t::server_url << "/route-tile/v1/" << baldr::GraphTile::kTilePathPattern
+      << "?version=%version&access_token=%token";
+
+  return oss.str();
+}
+
+boost::property_tree::ptree
+make_conf(const std::string& tile_dir, bool tile_url_gz, size_t curler_count) {
   // fake up config against pine grove traffic extract
   auto conf = json_to_pt(R"({
-      "mjolnir":{"tile_url":"127.0.0.1:8004"},
+      "mjolnir":{
+        "user_agent":"MapboxNavigationNative"
+      },
       "loki":{
         "actions":["locate","route","sources_to_targets","optimized_route","isochrone","trace_route","trace_attributes","transit_available"],
         "logging":{"long_request": 100},
-        "service_defaults":{"minimum_reachability": 50,"radius": 0,"search_cutoff": 35000, "node_snap_tolerance": 5, "street_side_tolerance": 5, "heading_tolerance": 60}
+        "service_defaults":{"minimum_reachability": 50,"radius": 0,"search_cutoff": 35000, "node_snap_tolerance": 5, "street_side_tolerance": 5, "street_side_max_distance": 1000, "heading_tolerance": 60}
       },
       "thor":{"logging":{"long_request": 110}},
       "skadi":{"actons":["height"],"logging":{"long_request": 5}},
@@ -164,15 +75,22 @@ boost::property_tree::ptree make_conf(const std::string& tile_dir, bool tile_url
       }
     })");
 
-  if (!tile_dir.empty())
+  conf.get_child("mjolnir").put("tile_url", get_tile_url());
+  if (!tile_dir.empty()) {
     conf.get_child("mjolnir").put("tile_dir", tile_dir);
+  }
+
+  if (curler_count > 1) {
+    conf.get_child("mjolnir").put("max_concurrent_reader_users", curler_count);
+  }
+
   conf.get_child("mjolnir").put("tile_url_gz", tile_url_gz);
   conf.get_child("loki").put("use_connectivity", false);
   return conf;
 }
 
 void test_route(const std::string& tile_dir, bool tile_url_gz) {
-  auto conf = make_conf(tile_dir, tile_url_gz);
+  auto conf = make_conf(tile_dir, tile_url_gz, 1);
   tyr::actor_t actor(conf);
 
   auto route_json = actor.route(R"({"locations":[{"lat":52.09620,"lon": 5.11909,"type":"break"},
@@ -181,44 +99,226 @@ void test_route(const std::string& tile_dir, bool tile_url_gz) {
   auto route = json_to_pt(route_json);
 
   // TODO: check result
-  if (route_json.find("Wijckskade") == std::string::npos ||
-      route_json.find("Lauwerstraat") == std::string::npos)
-    throw std::logic_error("didn't find the right street names in the route");
+  // didn't find the right street names in the route?
+  EXPECT_NE(route_json.find("Wijckskade"), std::string::npos);
+  EXPECT_NE(route_json.find("Lauwerstraat"), std::string::npos);
 }
 
-void test_no_cache_no_gz() {
+TEST(HttpTiles, test_no_cache_no_gz) {
   test_route("", false);
 }
 
-void test_cache_no_gz() {
-  filesystem::remove_all("url_tile_cache");
-  test_route("url_tile_cache", false);
-  filesystem::remove_all("url_tile_cache");
-}
-
-void test_no_cache_gz() {
+TEST(HttpTiles, test_no_cache_gz) {
   test_route("", true);
 }
 
-void test_cache_gz() {
-  filesystem::remove_all("url_tile_cache");
-  test_route("url_tile_cache", true);
-  filesystem::remove_all("url_tile_cache");
+class HttpTilesWithCache : public ::testing::Test {
+protected:
+  void SetUp() override {
+    filesystem::remove_all("url_tile_cache");
+  }
+  void TearDown() override {
+    filesystem::remove_all("url_tile_cache");
+  }
+};
+
+TEST_F(HttpTilesWithCache, test_cache_no_gz) {
+  test_route("url_tile_cache", false);
 }
 
-int main() {
-  test::suite suite("http_tiles");
+TEST_F(HttpTilesWithCache, test_cache_gz) {
+  test_route("url_tile_cache", true);
+}
 
-  // start a file server for utrecht tiles
-  suite.test(TEST_CASE(start_server));
+struct TestTileDownloadData {
+  TestTileDownloadData() {
+    test_tile_ids = {{3196, 0, 0},
+                     {818660, 2, 0},
+                     {51305, 1, 0},
+                     // non-existent tile to exercise 404 errors
+                     {200305, 2, 0}};
+    for (const auto& id : test_tile_ids) {
+      test_tile_names.emplace_back(baldr::GraphTile::FileSuffix(id, is_gzipped_tile));
+    }
+  }
 
-  suite.test(TEST_CASE(test_no_cache_no_gz));
+  baldr::GraphId get_nonexistent_tile_id() const {
+    return test_tile_ids.back();
+  }
 
-  suite.test(TEST_CASE(test_cache_no_gz));
+  const std::string tile_url_base = "127.0.0.1:8004/route-tile/v1/";
+  const std::string request_params = "?version=%version&access_token=%token";
+  const std::string full_tile_url_pattern =
+      tile_url_base + baldr::GraphTile::kTilePathPattern + request_params;
 
-  suite.test(TEST_CASE(test_no_cache_gz));
+  const bool is_gzipped_tile = false;
+  std::vector<baldr::GraphId> test_tile_ids;
+  std::vector<std::string> test_tile_names;
+};
 
-  suite.test(TEST_CASE(test_cache_gz));
+void test_tile_download(size_t tile_count, size_t curler_count, size_t thread_count) {
+  using namespace baldr;
 
-  return suite.tear_down();
+  TestTileDownloadData params;
+
+  const auto non_existent_tile_id = params.get_nonexistent_tile_id();
+
+  curl_tile_getter_t tile_getter(curler_count, "", params.is_gzipped_tile);
+  EXPECT_EQ(tile_getter.gzipped(), params.is_gzipped_tile);
+
+  std::vector<std::thread> threads;
+  threads.reserve(thread_count);
+  for (int thread_i = 0; thread_i < thread_count; ++thread_i) {
+    threads.emplace_back([&, thread_i]() {
+      for (int tile_i = 0; tile_i < tile_count; ++tile_i) {
+        bool is_for_this_thread = ((tile_i % thread_count) == thread_i);
+        if (!is_for_this_thread) {
+          continue;
+        }
+
+        auto test_tile_index = tile_i % params.test_tile_names.size();
+        auto tile_name = params.test_tile_names[test_tile_index];
+        auto expected_tile_id = params.test_tile_ids[test_tile_index];
+
+        auto tile_uri = params.tile_url_base;
+        tile_uri += tile_name;
+        tile_uri += params.request_params;
+        {
+          auto result = tile_getter.get(tile_uri);
+
+          if (result.status_ == tile_getter_t::status_code_t::SUCCESS) {
+            auto tile = GraphTile(GraphId(), result.bytes_.data(), result.bytes_.size());
+            EXPECT_EQ(tile.id(), expected_tile_id);
+          } else {
+            EXPECT_EQ(expected_tile_id, non_existent_tile_id);
+          }
+        }
+      }
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+}
+
+void test_graphreader_tile_download(size_t tile_count, size_t curler_count, size_t thread_count) {
+  using namespace baldr;
+
+  TestTileDownloadData params;
+
+  const auto non_existent_tile_id = params.get_nonexistent_tile_id();
+
+  curl_tile_getter_t tile_getter(curler_count, "", params.is_gzipped_tile);
+  EXPECT_EQ(tile_getter.gzipped(), params.is_gzipped_tile);
+
+  std::vector<std::thread> threads;
+  threads.reserve(thread_count);
+  for (int thread_i = 0; thread_i < thread_count; ++thread_i) {
+    threads.emplace_back([&, thread_i]() {
+      for (int tile_i = 0; tile_i < tile_count; ++tile_i) {
+        bool is_for_this_thread = ((tile_i % thread_count) == thread_i);
+        if (!is_for_this_thread) {
+          continue;
+        }
+
+        auto test_tile_index = tile_i % params.test_tile_names.size();
+        auto expected_tile_id = params.test_tile_ids[test_tile_index];
+        auto tile =
+            GraphTile::CacheTileURL(params.full_tile_url_pattern, expected_tile_id, &tile_getter, "");
+
+        if (expected_tile_id != non_existent_tile_id) {
+          EXPECT_EQ(tile.id(), expected_tile_id);
+        } else {
+          EXPECT_EQ(tile.header(), nullptr) << "Expected empty header";
+        }
+      }
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+}
+
+TEST(HttpTiles, test_curler_single_thread_download) {
+  test_tile_download(5, 1, 1);
+}
+
+TEST(HttpTiles, test_curler_multiple_threads_without_contention) {
+  test_tile_download(6, 3, 2);
+}
+
+TEST(HttpTiles, test_curler_multiple_threads_optimal) {
+  test_tile_download(8, 4, 4);
+}
+
+TEST(HttpTiles, test_curler_multiple_threads_contention) {
+  test_tile_download(6, 2, 5);
+}
+
+TEST(HttpTiles, test_graphreader_multiple_threads) {
+  test_graphreader_tile_download(8, 2, 4);
+}
+
+TEST(HttpTiles, test_interrupt) {
+  using namespace baldr;
+
+  TestTileDownloadData params;
+  const auto url_builder = [&params](size_t index) -> std::string {
+    auto test_tile_index = index % params.test_tile_names.size();
+    auto tile_name = params.test_tile_names[test_tile_index];
+    auto tile_uri = params.tile_url_base;
+    tile_uri += tile_name;
+    tile_uri += params.request_params;
+    return tile_uri;
+  };
+
+  const auto non_existent_tile_id = params.get_nonexistent_tile_id();
+  std::unordered_set<std::string> canceled_uris{url_builder(0), url_builder(2)};
+
+  curl_tile_getter_t tile_getter(2, "", params.is_gzipped_tile);
+  std::string tile_uri;
+  const curl_tile_getter_t::interrupt_t interrupt = [&tile_uri, &canceled_uris] {
+    if (canceled_uris.find(tile_uri) != canceled_uris.end()) {
+      throw std::runtime_error("Interrupt");
+    }
+  };
+
+  tile_getter.set_interrupt(&interrupt);
+  for (int tile_i = 0; tile_i < params.test_tile_ids.size(); ++tile_i) {
+    auto test_tile_index = tile_i % params.test_tile_names.size();
+    auto expected_tile_id = params.test_tile_ids[test_tile_index];
+
+    tile_uri = url_builder(tile_i);
+    if (canceled_uris.find(tile_uri) != canceled_uris.end()) {
+      EXPECT_THROW(tile_getter.get(tile_uri), std::runtime_error);
+      continue;
+    }
+
+    auto result = tile_getter.get(tile_uri);
+    if (result.status_ == tile_getter_t::status_code_t::SUCCESS) {
+      auto tile = GraphTile(GraphId(), result.bytes_.data(), result.bytes_.size());
+      EXPECT_EQ(tile.id(), expected_tile_id);
+    } else {
+      EXPECT_EQ(expected_tile_id, non_existent_tile_id);
+    }
+  }
+}
+
+class HttpTilesEnv : public ::testing::Environment {
+public:
+  void SetUp() override {
+    // start a file server for utrecht tiles
+    test_tile_server_t::start("test/data/utrecht_tiles", context);
+  }
+
+  void TearDown() override {
+  }
+};
+
+int main(int argc, char* argv[]) {
+  testing::AddGlobalTestEnvironment(new HttpTilesEnv);
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }

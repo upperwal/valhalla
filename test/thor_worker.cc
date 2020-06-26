@@ -29,7 +29,7 @@ const auto conf = json_to_pt(R"({
     "loki":{
       "actions":["locate","route","sources_to_targets","optimized_route","isochrone","trace_route","trace_attributes"],
       "logging":{"long_request": 100},
-      "service_defaults":{"minimum_reachability": 50,"radius": 0,"search_cutoff": 35000, "node_snap_tolerance": 5, "street_side_tolerance": 5, "heading_tolerance": 60}
+      "service_defaults":{"minimum_reachability": 50,"radius": 0,"search_cutoff": 35000, "node_snap_tolerance": 5, "street_side_tolerance": 5, "street_side_max_distance": 1000, "heading_tolerance": 60}
     },
     "thor":{"logging":{"long_request": 110}},
     "skadi":{"actons":["height"],"logging":{"long_request": 5}},
@@ -56,7 +56,7 @@ const auto conf = json_to_pt(R"({
     }
   })");
 
-void test_parse_filter_attributes_defaults() {
+TEST(ThorWorker, test_parse_filter_attributes_defaults) {
   tyr::actor_t actor(conf, true);
 
   auto result = json_to_pt(actor.trace_attributes(
@@ -64,18 +64,14 @@ void test_parse_filter_attributes_defaults() {
           {"lat":52.09110,"lon":5.09806},
           {"lat":52.09098,"lon":5.09679}]})"));
 
-  if (result.get_child_optional("shape_attributes"))
-    throw std::logic_error("Expected excluded shape_attributes | found shape_attributes=" +
-                           result.get<std::string>("shape_attributes"));
+  EXPECT_FALSE(result.get_child_optional("shape_attributes")) << "Expected excluded shape_attributes";
 
-  if (!result.get_child_optional("edges"))
-    throw std::logic_error("Expected included edges");
+  EXPECT_TRUE(result.get_child_optional("edges")) << "Expected included edges";
 
-  if (!result.get_child_optional("shape"))
-    throw std::logic_error("Expected included shape");
+  EXPECT_TRUE(result.get_child_optional("shape")) << "Expected included shape";
 }
 
-void test_parse_filter_attributes_excludes() {
+TEST(ThorWorker, test_parse_filter_attributes_excludes) {
   tyr::actor_t actor(conf, true);
 
   std::vector<std::string> test_cases = {
@@ -102,13 +98,13 @@ void test_parse_filter_attributes_excludes() {
 
   for (size_t i = 0; i < test_cases.size(); ++i) {
     auto result = json_to_pt(test_cases[i]);
-    if (result.get_child_optional(excluded_keys[i]))
-      throw std::logic_error("Expected excluded shape | found " + excluded_keys[i] + "=" +
-                             result.get<std::string>(excluded_keys[i]));
+    EXPECT_FALSE(result.get_child_optional(excluded_keys[i]))
+        << "Expected excluded shape | found " + excluded_keys[i] + "=" +
+               result.get<std::string>(excluded_keys[i]);
   }
 }
 
-void test_parse_filter_attributes_includes() {
+TEST(ThorWorker, test_parse_filter_attributes_includes) {
   tyr::actor_t actor(conf, true);
 
   std::vector<std::string> test_cases = {
@@ -131,20 +127,13 @@ void test_parse_filter_attributes_includes() {
 
   for (size_t i = 0; i < test_cases.size(); ++i) {
     auto result = json_to_pt(test_cases[i]);
-    if (!result.get_child_optional(included_keys[i]))
-      throw std::logic_error("Expected " + included_keys[i] + " to be present");
+    EXPECT_TRUE(result.get_child_optional(included_keys[i]))
+        << "Expected " + included_keys[i] + " to be present";
   }
 }
 } // namespace
 
-int main(void) {
-  test::suite suite("Thor Worker");
-
-  suite.test(TEST_CASE(test_parse_filter_attributes_defaults));
-
-  suite.test(TEST_CASE(test_parse_filter_attributes_excludes));
-
-  suite.test(TEST_CASE(test_parse_filter_attributes_includes));
-
-  return suite.tear_down();
+int main(int argc, char* argv[]) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }

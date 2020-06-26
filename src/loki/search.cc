@@ -1,5 +1,7 @@
 #include "loki/search.h"
+#include "baldr/graphconstants.h"
 #include "baldr/tilehierarchy.h"
+#include "loki/reach.h"
 #include "midgard/distanceapproximator.h"
 #include "midgard/linesegment2.h"
 #include "midgard/util.h"
@@ -19,6 +21,26 @@ namespace {
 
 template <typename T> inline T square(T v) {
   return v * v;
+}
+
+bool is_search_filter_triggered(const DirectedEdge* edge,
+                                const Location::SearchFilter& search_filter) {
+  // check if this edge matches any of the exclusion filters
+  uint32_t road_class = static_cast<uint32_t>(edge->classification());
+  uint32_t min_road_class = static_cast<uint32_t>(search_filter.min_road_class_);
+  uint32_t max_road_class = static_cast<uint32_t>(search_filter.max_road_class_);
+
+  // Note that min_ and max_road_class are integers where, by default, max_road_class
+  // is 0 and min_road_class is 7. This filter rejects roads where the functional
+  // road class is outside of the min to max range.
+  if ((road_class > min_road_class || road_class < max_road_class) ||
+      (search_filter.exclude_tunnel_ && edge->tunnel()) ||
+      (search_filter.exclude_bridge_ && edge->bridge()) ||
+      (search_filter.exclude_ramp_ && (edge->use() == Use::kRamp))) {
+    return true;
+  }
+
+  return false;
 }
 
 bool side_filter(const PathLocation::PathEdge& edge, const Location& location, GraphReader& reader) {
@@ -43,20 +65,12 @@ bool side_filter(const PathLocation::PathEdge& edge, const Location& location, G
   return same != (location.preferred_side_ == Location::PreferredSide::SAME);
 }
 
-bool heading_filter(const DirectedEdge* edge,
-                    const EdgeInfo& info,
-                    const Location& location,
-                    const PointLL& point,
-                    size_t index) {
+bool heading_filter(const Location& location, float angle) {
   // no heading means we filter nothing
   if (!location.heading_) {
     return false;
   }
 
-  // get the angle of the shape from this point
-  auto angle =
-      tangent_angle(index, point, info.shape(),
-                    GetOffsetForHeading(edge->classification(), edge->use()), edge->forward());
   // we want the closest distance between two angles which can be had
   // across 0 or between the two so we just need to know which is bigger
   if (*location.heading_ > angle) {
@@ -86,6 +100,7 @@ struct candidate_t {
   double sq_distance;
   PointLL point;
   size_t index;
+  bool prefiltered;
 
   GraphId edge_id;
   const DirectedEdge* edge;
@@ -97,21 +112,47 @@ struct candidate_t {
     return sq_distance < c.sq_distance;
   }
 
-  PathLocation::SideOfStreet
-  get_side(const PointLL& original, double sq_distance, double sq_tolerance) const {
-    // its so close to the edge that its basically on the edge
-    if (sq_distance < sq_tolerance) {
+  PathLocation::SideOfStreet get_side(const PointLL& original,
+                                      float tang_angle,
+                                      double sq_distance,
+                                      double sq_tolerance,
+                                      double sq_max_distance) const {
+    // point is so close to the edge that its basically on the edge,
+    // or its too far from the edge that we shouldn't use it to determine side of street
+    if (sq_distance < sq_tolerance || sq_distance > sq_max_distance) {
       return PathLocation::SideOfStreet::NONE;
     }
 
-    // get the side TODO: this can technically fail for longer segments..
-    // to fix it we simply compute the plane formed by the triangle
-    // through the center of the earth and the two shape points and test
-    // whether the original point is above or below the plane (depending on winding)
-    auto& shape = edge_info->shape();
-    LineSegment2<PointLL> segment(shape[index], shape[index + 1]);
-    return (segment.IsLeft(original) > 0) == edge->forward() ? PathLocation::SideOfStreet::LEFT
-                                                             : PathLocation::SideOfStreet::RIGHT;
+    // get the absolute angle between the snap point and the provided point
+    auto angle_to_point = point.Heading(original);
+
+    // add 360 degrees if angle becomes negative
+    auto angle_diff = angle_to_point - tang_angle;
+    if (angle_diff < 0) {
+      angle_diff += 360.f;
+    }
+
+    // 10 degrees on either side is considered to be straight ahead
+    constexpr float angle_tolerance = 10.f;
+
+    // check which side the point falls in:
+    // If angle_diff is between 10 and 170 it's on the right side,
+    // if angle_diff is between 190 and 350 it's on the left side,
+    // otherwise it's practically straight ahead or behind.
+    //
+    //       \    L    /
+    //        \       /
+    //  - - - - - x - - - - -
+    //        /       \
+    //       /    R    \
+    //
+    if (angle_diff > angle_tolerance && angle_diff < (180.f - angle_tolerance)) {
+      return PathLocation::SideOfStreet::RIGHT;
+    } else if (angle_diff > (180.f + angle_tolerance) && angle_diff < (360.f - angle_tolerance)) {
+      return PathLocation::SideOfStreet::LEFT;
+    } else {
+      return PathLocation::SideOfStreet::NONE;
+    }
   }
 };
 
@@ -195,57 +236,38 @@ struct projector_wrapper {
 struct bin_handler_t {
   std::vector<projector_wrapper> pps;
   valhalla::baldr::GraphReader& reader;
-  const EdgeFilter& edge_filter;
-  const NodeFilter& node_filter;
+  EdgeFilter edge_filter;
+  NodeFilter node_filter;
+  std::shared_ptr<DynamicCost> costing;
   unsigned int max_reach_limit;
   std::vector<candidate_t> bin_candidates;
   std::unordered_set<uint64_t> correlated_edges;
+  Reach reach_finder;
 
-  // key is the edge id, size_t is the index into the reachability number
-  // which stores the number of nodes you can reach from a given node in the
-  // in the forward direction. TODO: direction is important because it answers
-  // the question, can i get out of here? importantly it currently doesnt answer
-  // the question of whether you can get into a place for that we need the
-  // reverse direction reachability
-  std::vector<unsigned int> reaches;
-  std::unordered_map<uint64_t, size_t> reach_indices;
-
-  // TODO: keep track of a reachability object per node
-  struct reachability_t {
-    size_t round;
-    unsigned int forward_reach;
-    unsigned int backward_reach;
-  };
+  // keep track of edges whose reachability we've already computed
+  // TODO: dont use pointers as keys, its safe for now but fancy caching one day could be bad
+  std::unordered_map<const DirectedEdge*, directed_reach> directed_reaches;
 
   bin_handler_t(const std::vector<valhalla::baldr::Location>& locations,
                 valhalla::baldr::GraphReader& reader,
-                const EdgeFilter& edge_filter,
-                const NodeFilter& node_filter)
-      : reader(reader), edge_filter(edge_filter), node_filter(node_filter) {
+                const std::shared_ptr<DynamicCost>& costing)
+      : reader(reader), costing(costing), edge_filter(costing->GetEdgeFilter()),
+        node_filter(costing->GetNodeFilter()) {
     // get the unique set of input locations and the max reachability of them all
     std::unordered_set<Location> uniq_locations(locations.begin(), locations.end());
     pps.reserve(uniq_locations.size());
     max_reach_limit = 0;
     for (const auto& loc : uniq_locations) {
       pps.emplace_back(loc, reader);
-      max_reach_limit = std::max(max_reach_limit, loc.minimum_reachability_);
+      max_reach_limit = std::max(max_reach_limit, loc.min_outbound_reach_);
+      max_reach_limit = std::max(max_reach_limit, loc.min_inbound_reach_);
     }
     // very annoying but it saves a lot of time to preallocate this instead of doing it in the loop
     // in handle_bins
     bin_candidates.resize(pps.size());
     // TODO: make space for reach check in a more empirical way
-    reach_indices.reserve(std::max(max_reach_limit, static_cast<decltype(max_reach_limit)>(1)) *
-                          1024);
-    reaches.reserve(std::max(max_reach_limit, static_cast<decltype(max_reach_limit)>(1)) * 1024);
-  }
-
-  // returns 0 when we dont know it
-  unsigned int get_reach(const DirectedEdge* edge) {
-    auto itr = reach_indices.find(edge->endnode());
-    if (itr == reach_indices.cend()) {
-      return 0; // TODO: if we didnt find it should we run the reachability check
-    }
-    return reaches[itr->second];
+    auto reservation = std::max(max_reach_limit, static_cast<decltype(max_reach_limit)>(1));
+    directed_reaches.reserve(reservation * 1024);
   }
 
   void correlate_node(const Location& location,
@@ -253,6 +275,9 @@ struct bin_handler_t {
                       const candidate_t& candidate,
                       PathLocation& correlated,
                       std::vector<PathLocation::PathEdge>& filtered) {
+    // the search cutoff is a hard filter so skip any outside of that
+    if (candidate.point.Distance(location.latlng_) > location.search_cutoff_)
+      return;
     // we need this because we might need to go to different levels
     float distance = std::numeric_limits<float>::lowest();
     std::function<void(const GraphId& node_id, bool transition)> crawl;
@@ -269,22 +294,28 @@ struct bin_handler_t {
       // cache the distance
       if (distance == std::numeric_limits<float>::lowest())
         distance = node_ll.Distance(location.latlng_);
-      // the search cutoff is a hard filter so skip any outside of that
-      if (distance > location.search_cutoff_)
-        return;
       // add edges entering/leaving this node
       for (const auto* edge = start_edge; edge < end_edge; ++edge) {
         // get some info about this edge and the opposing
         GraphId id = tile->id();
         id.set_id(node->edge_index() + (edge - start_edge));
         auto info = tile->edgeinfo(edge->edgeinfo_offset());
-
+        // calculate the heading of the snapped point to the shape for use in heading filter
+        size_t index = edge->forward() ? 0 : info.shape().size() - 2;
+        float angle =
+            tangent_angle(index, candidate.point, info.shape(),
+                          GetOffsetForHeading(edge->classification(), edge->use()), edge->forward());
         // do we want this edge
         if (edge_filter(edge) != 0.0f) {
-          PathLocation::PathEdge path_edge{std::move(id),  0.f, node_ll, distance, PathLocation::NONE,
-                                           get_reach(edge)};
-          auto index = edge->forward() ? 0 : info.shape().size() - 2;
-          if (heading_filter(edge, info, location, candidate.point, index)) {
+          auto reach = get_reach(id, edge);
+          PathLocation::PathEdge path_edge{std::move(id),
+                                           0.f,
+                                           node_ll,
+                                           distance,
+                                           PathLocation::NONE,
+                                           reach.outbound,
+                                           reach.inbound};
+          if (heading_filter(location, angle)) {
             filtered.emplace_back(std::move(path_edge));
           } else if (correlated_edges.insert(path_edge.id).second) {
             correlated.edges.push_back(std::move(path_edge));
@@ -299,15 +330,16 @@ struct bin_handler_t {
         }
         const auto* other_edge = other_tile->directededge(other_id);
         if (edge_filter(other_edge) != 0.0f) {
+          auto reach = get_reach(other_id, other_edge);
           PathLocation::PathEdge path_edge{std::move(other_id),
                                            1.f,
                                            node_ll,
                                            distance,
                                            PathLocation::NONE,
-                                           get_reach(other_edge)};
-          auto index = other_edge->forward() ? 0 : info.shape().size() - 2;
-          if (heading_filter(other_edge, tile->edgeinfo(edge->edgeinfo_offset()), location,
-                             candidate.point, index)) {
+                                           reach.outbound,
+                                           reach.inbound};
+          // angle is 180 degrees opposite direction of the one above
+          if (heading_filter(location, std::fmod(angle + 180.f, 360.f))) {
             filtered.emplace_back(std::move(path_edge));
           } else if (correlated_edges.insert(path_edge.id).second) {
             correlated.edges.push_back(std::move(path_edge));
@@ -352,15 +384,27 @@ struct bin_handler_t {
       if (!candidate.edge->forward()) {
         length_ratio = 1.f - length_ratio;
       }
-      // side of street
+      // calculate the heading of the snapped point to the shape for use in heading
+      // filter and side of street calculation
+      float angle =
+          tangent_angle(candidate.index, candidate.point, candidate.edge_info->shape(),
+                        GetOffsetForHeading(candidate.edge->classification(), candidate.edge->use()),
+                        candidate.edge->forward());
       auto sq_tolerance = square(double(location.street_side_tolerance_));
-      auto side = candidate.get_side(location.latlng_, candidate.sq_distance, sq_tolerance);
+      auto sq_max_distance = square(double(location.street_side_max_distance_));
+      auto side =
+          candidate.get_side(location.display_latlng_ ? *location.display_latlng_ : location.latlng_,
+                             angle,
+                             location.display_latlng_
+                                 ? location.display_latlng_->DistanceSquared(candidate.point)
+                                 : candidate.sq_distance,
+                             sq_tolerance, sq_max_distance);
+      auto reach = get_reach(candidate.edge_id, candidate.edge);
       PathLocation::PathEdge path_edge{candidate.edge_id, length_ratio, candidate.point,
-                                       distance,          side,         get_reach(candidate.edge)};
+                                       distance,          side,         reach.outbound,
+                                       reach.inbound};
       // correlate the edge we found
-      if (side_filter(path_edge, location, reader) ||
-          heading_filter(candidate.edge, *candidate.edge_info, location, candidate.point,
-                         candidate.index)) {
+      if (side_filter(path_edge, location, reader) || heading_filter(location, angle)) {
         filtered.push_back(std::move(path_edge));
       } else if (correlated_edges.insert(candidate.edge_id).second) {
         correlated.edges.push_back(std::move(path_edge));
@@ -371,12 +415,13 @@ struct bin_handler_t {
       const DirectedEdge* other_edge;
       if (opposing_edge_id.Is_Valid() && (other_edge = other_tile->directededge(opposing_edge_id)) &&
           edge_filter(other_edge) != 0.0f) {
-        PathLocation::PathEdge other_path_edge{opposing_edge_id, 1 - length_ratio,
-                                               candidate.point,  distance,
-                                               flip_side(side),  get_reach(other_edge)};
+        auto reach = get_reach(opposing_edge_id, other_edge);
+        PathLocation::PathEdge other_path_edge{opposing_edge_id, 1 - length_ratio, candidate.point,
+                                               distance,         flip_side(side),  reach.outbound,
+                                               reach.inbound};
+        // angle is 180 degrees opposite of the one above
         if (side_filter(other_path_edge, location, reader) ||
-            heading_filter(other_edge, *candidate.edge_info, location, candidate.point,
-                           candidate.index)) {
+            heading_filter(location, std::fmod(angle + 180.f, 360.f))) {
           filtered.push_back(std::move(other_path_edge));
         } else if (correlated_edges.insert(opposing_edge_id).second) {
           correlated.edges.push_back(std::move(other_path_edge));
@@ -385,102 +430,32 @@ struct bin_handler_t {
     }
   }
 
-  // recursive depth first search for expanding nodes
-  // TODO: test whether writing this non-recursively would be faster
-  void depth_first(const GraphTile*& tile, const NodeInfo* node, size_t& reach_index) {
-    // for each edge recurse on the usable ones
-    const GraphTile* start_tile = tile;
-    auto* e = tile->directededge(node->edge_index());
-    for (uint32_t i = 0; reaches.back() < max_reach_limit && i < node->edge_count(); ++i, ++e) {
-      // if we can take the edge and we can get the node and we can pass through the node
-      const NodeInfo* n = nullptr;
-      if ((edge_filter(e) != 0.f) && (n = reader.GetEndNode(e, tile)) && !node_filter(n)) {
-        // try to mark the node
-        auto inserted = reach_indices.emplace(e->endnode(), reach_index);
-        // we saw this one already
-        if (!inserted.second) {
-          // we've seen this node in this run so just skip it
-          if (reach_index == inserted.first->second) {
-            continue;
-          }
+  directed_reach get_reach(const GraphId edge_id, const DirectedEdge* edge) {
+    // if its in cache return it
+    auto itr = directed_reaches.find(edge);
+    if (itr != directed_reaches.cend())
+      return itr->second;
 
-          // signal the recursion to stop
-          reach_index = inserted.first->second;
-          // merge this paths reach with the previously found one
-          reaches.back() += reaches[reach_index] - 1;
-          reaches[reach_index] = reaches.back();
-          return;
-        }
-
-        // Increment and recurse
-        ++reaches.back();
-        size_t previous = reach_index;
-        depth_first(tile, n, reach_index);
-
-        // if we saw the edge in a previous run we want to be done completely
-        if (reach_index != previous) {
-          return;
-        }
-      }
-    }
-
-    // Follow transition to other hierarchy levels
-    if (node->transition_count() > 0) {
-      const NodeTransition* trans = start_tile->transition(node->transition_index());
-      for (uint32_t i = 0; reaches.back() < max_reach_limit && i < node->transition_count();
-           ++i, ++trans) {
-        const auto* trans_tile = reader.GetGraphTile(trans->endnode());
-        if (trans_tile == nullptr) {
-          // Protect against missing tile
-          continue;
-        }
-        const NodeInfo* n = trans_tile->node(trans->endnode());
-        if (!node_filter(n)) {
-          // try to mark the node
-          auto inserted = reach_indices.emplace(trans->endnode(), reach_index);
-          // we saw this one already
-          if (!inserted.second) {
-            // we've seen this node in this run so just skip it
-            if (reach_index == inserted.first->second) {
-              continue;
-            }
-
-            // signal the recursion to stop
-            reach_index = inserted.first->second;
-            // merge this paths reach with the previously found one
-            reaches.back() += reaches[reach_index] - 1;
-            reaches[reach_index] = reaches.back();
-            return;
-          }
-
-          // For transitions, recurse but don't increment so we don't double count nodes
-          size_t previous = reach_index;
-          depth_first(trans_tile, n, reach_index);
-
-          // if we saw the edge in a previous run we want to be done completely
-          if (reach_index != previous) {
-            return;
-          }
-        }
-      }
-    }
+    // notice we do both directions here because in the end we use this reach for all input locations
+    auto reach = reach_finder(edge, edge_id, max_reach_limit, reader, costing, kInbound | kOutbound);
+    directed_reaches[edge] = reach;
+    return reach;
   }
 
   // do a mini network expansion or maybe not
-  unsigned int check_reachability(std::vector<projector_wrapper>::iterator begin,
-                                  std::vector<projector_wrapper>::iterator end,
-                                  const GraphTile* tile,
-                                  const DirectedEdge* edge) {
+  directed_reach check_reachability(std::vector<projector_wrapper>::iterator begin,
+                                    std::vector<projector_wrapper>::iterator end,
+                                    const GraphTile* tile,
+                                    const DirectedEdge* edge,
+                                    const GraphId edge_id) {
     // no need when set to 0
-    if (max_reach_limit == 0) {
-      return 0;
-    }
+    if (max_reach_limit == 0)
+      return {};
 
     // do we already know about this one?
-    auto found = reach_indices.find(edge->endnode());
-    if (found != reach_indices.cend()) {
-      return reaches[found->second];
-    }
+    auto found = directed_reaches.find(edge);
+    if (found != directed_reaches.cend())
+      return found->second;
 
     // we only want to waste time checking if this could become the best reachable option for a
     // given location
@@ -492,24 +467,21 @@ struct bin_handler_t {
     }
 
     // assume its reachable
-    if (!check) {
-      return max_reach_limit;
-    }
+    if (!check)
+      return {max_reach_limit, max_reach_limit};
 
-    // if you cant get through the end node then its not reachable since you cant leave the edge
-    const auto* node = reader.GetEndNode(edge, tile);
-    if (!node || node_filter(node)) {
-      return 0;
-    }
+    // notice we do both directions here because in the end we use this reach for all input locations
+    auto reach = reach_finder(edge, edge_id, max_reach_limit, reader, costing, kInbound | kOutbound);
+    directed_reaches[edge] = reach;
 
-    // store an index into cardinalities so we can tell when search paths merge
-    // if the index changes then we know its been merged with another path
-    // any node can reach itself so each of them starts at a reach of 1
-    size_t reach_index = reaches.size();
-    reach_indices[edge->endnode()] = reach_index;
-    reaches.push_back(1);
-    depth_first(tile, node, reach_index);
-    return reaches.back();
+    // if the inbound reach is not 0 and the outbound reach is not 0 and the opposing edge is not
+    // filtered then the reaches of both edges are the same
+    const DirectedEdge* opp_edge = nullptr;
+    if (reach.outbound > 0 && reach.inbound > 0 && (opp_edge = reader.GetOpposingEdge(edge, tile)) &&
+        edge_filter(opp_edge) > 0.f)
+      directed_reaches[opp_edge] = reach;
+
+    return reach;
   }
 
   // handle a bin for the range of candidates that share it
@@ -518,24 +490,41 @@ struct bin_handler_t {
     // iterate over the edges in the bin
     auto tile = begin->cur_tile;
     auto edges = tile->GetBin(begin->bin_index);
-    for (auto e : edges) {
+    for (auto edge_id : edges) {
       // get the tile and edge
-      if (!reader.GetGraphTile(e, tile)) {
+      if (!reader.GetGraphTile(edge_id, tile)) {
         continue;
       }
 
-      // no thanks on this one or its evil twin
-      const auto* edge = tile->directededge(e);
-      if (edge_filter(edge) == 0.0f && (!(e = reader.GetOpposingEdgeId(e, tile)).Is_Valid() ||
-                                        edge_filter(edge = tile->directededge(e)) == 0.0f)) {
-        continue;
+      // if this edge is filtered
+      const auto* edge = tile->directededge(edge_id);
+      if (edge_filter(edge) == 0.0f) {
+        // then we try its opposing edge
+        edge_id = reader.GetOpposingEdgeId(edge_id, tile);
+        // but if we couldnt get it or its filtered too then we move on
+        if (!edge_id.Is_Valid())
+          continue;
+        edge = tile->directededge(edge_id);
+        if (edge_filter(edge) == 0.0f)
+          continue;
       }
 
-      // reset these so we know the best point along the edge
+      // initialize candidates vector:
+      // - reset sq_distance to max so we know the best point along the edge
+      // - apply prefilters based on user's SearchFilter request options
       auto c_itr = bin_candidates.begin();
       decltype(begin) p_itr;
+      bool all_prefiltered = true;
       for (p_itr = begin; p_itr != end; ++p_itr, ++c_itr) {
         c_itr->sq_distance = std::numeric_limits<float>::max();
+        c_itr->prefiltered = is_search_filter_triggered(edge, p_itr->location.search_filter_);
+        // set to false if even one candidate was not filtered
+        all_prefiltered = all_prefiltered && c_itr->prefiltered;
+      }
+
+      // short-circuit if all candidates were prefiltered
+      if (all_prefiltered) {
+        continue;
       }
 
       // TODO: can we speed this up? the majority of edges will be short and far away enough
@@ -561,6 +550,10 @@ struct bin_handler_t {
         // for each input point
         c_itr = bin_candidates.begin();
         for (p_itr = begin; p_itr != end; ++p_itr, ++c_itr) {
+          // skip updating this candidate because it was prefiltered
+          if (c_itr->prefiltered) {
+            continue;
+          }
           // how close is the input to this segment
           auto point = p_itr->project(u, v);
           auto sq_distance = p_itr->project.approx.DistanceSquared(point);
@@ -574,19 +567,40 @@ struct bin_handler_t {
       }
 
       // if we already have a better reachable candidate we can just assume this one is reachable
-      auto reachability = check_reachability(begin, end, tile, edge);
+      auto reach = check_reachability(begin, end, tile, edge, edge_id);
 
       // keep the best point along this edge if it makes sense
       c_itr = bin_candidates.begin();
       for (p_itr = begin; p_itr != end; ++p_itr, ++c_itr) {
-        // which batch of findings
-        bool reachable = reachability >= p_itr->location.minimum_reachability_;
+        // skip updating this candidate because it was prefiltered
+        if (c_itr->prefiltered) {
+          continue;
+        }
+        // is this edge reachable in the right way
+        bool reachable = reach.outbound >= p_itr->location.min_outbound_reach_ &&
+                         reach.inbound >= p_itr->location.min_inbound_reach_;
+        // it's possible that it isnt reachable but the opposing is, switch to that if so
+        const GraphTile* opp_tile = tile;
+        const DirectedEdge* opp_edge = nullptr;
+        if (!reachable && (opp_edge = reader.GetOpposingEdge(edge, opp_tile)) &&
+            edge_filter(opp_edge) > 0.f) {
+          auto opp_reach = check_reachability(begin, end, opp_tile, opp_edge, edge_id);
+          if (opp_reach.outbound >= p_itr->location.min_outbound_reach_ &&
+              opp_reach.inbound >= p_itr->location.min_inbound_reach_) {
+            tile = opp_tile;
+            edge = opp_edge;
+            reach = opp_reach;
+            reachable = true;
+          }
+        }
+
+        // which batch of findings will this go into
         auto* batch = reachable ? &p_itr->reachable : &p_itr->unreachable;
 
         // if its empty append
         if (batch->empty()) {
           c_itr->edge = edge;
-          c_itr->edge_id = e;
+          c_itr->edge_id = edge_id;
           c_itr->edge_info = edge_info;
           c_itr->tile = tile;
           batch->emplace_back(std::move(*c_itr));
@@ -608,7 +622,7 @@ struct bin_handler_t {
         // it has to either be better or in the radius to move on
         if (in_radius || better) {
           c_itr->edge = edge;
-          c_itr->edge_id = e;
+          c_itr->edge_id = edge_id;
           c_itr->edge_info = edge_info;
           c_itr->tile = tile;
           // the last one wasnt in the radius so replace it with this one because its better or is
@@ -777,14 +791,17 @@ namespace loki {
 std::unordered_map<valhalla::baldr::Location, PathLocation>
 Search(const std::vector<valhalla::baldr::Location>& locations,
        GraphReader& reader,
-       const EdgeFilter& edge_filter,
-       const NodeFilter& node_filter) {
+       const std::shared_ptr<DynamicCost>& costing) {
+  // we cannot continue without costing
+  if (!costing)
+    throw std::runtime_error("No costing was provided for edge candidate search");
+
   // trivially finished already
-  if (locations.empty()) {
+  if (locations.empty())
     return std::unordered_map<valhalla::baldr::Location, PathLocation>{};
-  };
+
   // setup the unique list of locations
-  bin_handler_t handler(locations, reader, edge_filter, node_filter);
+  bin_handler_t handler(locations, reader, costing);
   // search over the bins doing multiple locations per bin
   handler.search();
   // turn each locations candidate set into path locations

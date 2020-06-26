@@ -28,8 +28,8 @@ To build a route, you need to specify two `break` locations. In addition, you ca
 
 | Location parameters | Description |
 | :--------- | :----------- |
-| `lat` | Latitude of the location in degrees. |
-| `lon` | Longitude of the location in degrees. |
+| `lat` | Latitude of the location in degrees. This is assumed to be both the routing location and the display location if no `display_lat` and `display_lon` are provided. |
+| `lon` | Longitude of the location in degrees. This is assumed to be both the routing location and the display location if no `display_lat` and `display_lon` are provided. |
 | `type` | Type of location, either `break`, `through`, `via` or `break_through`. Each type controls two characteristics: whether or not to allow a u-turn at the location and whether or not to generate guidance/legs at the location. A `break` is a location at which we allows u-turns and generate legs and arrival/departure maneuvers. A `through` location is a location at which we neither allow u-turns nor generate legs or arrival/departure maneuvers. A `via` location is a location at which we allow u-turns but do not generate legs or arrival/departure maneuvers. A `break_through` location is a location at which we do not allow u-turns but do generate legs and arrival/departure maneuvers. If no type is provided, the type is assumed to be a `break`. The types of the first and last locations are ignored and are treated as `break`s. |
 | `heading` | (optional) Preferred direction of travel for the start from the location. This can be useful for mobile routing where a vehicle is traveling in a specific direction along a road, and the route should start in that direction. The `heading` is indicated in degrees from north in a clockwise direction, where north is 0°, east is 90°, south is 180°, and west is 270°. |
 | `heading_tolerance` | (optional) How close in degrees a given street's angle must be in order for it to be considered as in the same direction of the `heading` parameter. The default value is 60 degrees. |
@@ -39,9 +39,13 @@ To build a route, you need to specify two `break` locations. In addition, you ca
 | `radius` | The number of meters about this input location within which edges (roads between intersections) will be considered as candidates for said location. When correlating this location to the route network, try to only return results within this distance (meters) from this location. If there are no candidates within this distance it will return the closest candidate within reason. If this value is larger than the configured service limit it will be clamped to that limit. The default is 0 meters. |
 | `rank_candidates` | Whether or not to rank the edge candidates for this location. The ranking is used as a penalty within the routing algorithm so that some edges will be penalized more heavily than others. If `true` candidates will be ranked according to their distance from the input and various other attributes. If `false` the candidates will all be treated as equal which should lead to routes that are just the most optimal path with emphasis about which edges were selected. |
 | `preferred_side` | If the location is not offset from the road centerline or is closest to an intersection this option has no effect. Otherwise the determined side of street is used to determine whether or not the location should be visited from the `same`, `opposite` or `either` side of the road with respect to the side of the road the given locale drives on. In Germany (driving on the right side of the road), passing a value of `same` will only allow you to leave from or arrive at a location such that the location will be on your right. In Australia (driving on the left side of the road), passing a value of `same` will force the location to be on your left. A value of `opposite` will enforce arriving/departing from a location on the opposite side of the road from that which you would be driving on while a value of `either` will make no attempt limit the side of street that is available for the route. |
+| `display_lat` | Latitude of the map location in degrees. If provided the `lat` and `lon` parameters will be treated as the routing location and the `display_lat` and `display_lon` will be used to determine the side of street. Both `display_lat` and `display_lon` must be provided and valid to achieve the desired effect. |
+| `display_lon` | Longitude of the map location in degrees. If provided the `lat` and `lon` parameters will be treated as the routing location and the `display_lat` and `display_lon` will be used to determine the side of street. Both `display_lat` and `display_lon` must be provided and valid to achieve the desired effect. |
 | `search_cutoff` | The cutoff at which we will assume the input is too far away from civilisation to be worth correlating to the nearest graph elements |
 | `node_snap_tolerance` | During edge correlation this is the tolerance used to determine whether or not to snap to the intersection rather than along the street, if the snap location is within this distance from the intersection the intersection is used instead. The default is 5 meters |
 | `street_side_tolerance` | If your input coordinate is less than this tolerance away from the edge centerline then we set your side of street to none otherwise your side of street will be left or right depending on direction of travel |
+| `street_side_max_distance` | The max distance in meters that the input coordinates or display ll can be from the edge centerline for them to be used for determining the side of street. Beyond this distance the side of street is set to none |
+| `search_filter` | A set of optional filters to exclude candidate edges based on their attribution. The following exclusion filters are supported: <ul><li>`exclude_tunnel` (boolean, defaults to `false`): whether to exclude roads marked as tunnels</li><li>`exclude_bridge` (boolean, defaults to `false`): whether to exclude roads marked as bridges</li><li>`exclude_ramp` (boolean, defaults to `false`): whether to exclude link roads marked as ramps, note that some turn channels are also marked as ramps</li><li>`min_road_class` (string, defaults to `"service_other"`): lowest road class allowed</li><li>`max_road_class` (string, defaults to `"motorway"`): highest road class allowed</li></ul>Road classes from highest to lowest are: motorway, trunk, primary, secondary, tertiary, unclassified, residential, service_other.
 
 Optionally, you can include the following location information without impacting the routing. This information is carried through the request and returned as a convenience.
 
@@ -67,6 +71,7 @@ Valhalla's routing service uses dynamic, run-time costing to generate the route 
 | `auto_shorter` | Alternate costing for driving that provides a short path (though not guaranteed to be shortest distance) that obeys driving rules for access and turn restrictions. |
 | `bicycle` | Standard costing for travel by bicycle, with a slight preference for using [cycleways](http://wiki.openstreetmap.org/wiki/Key:cycleway) or roads with bicycle lanes. Bicycle routes follow regular roads when needed, but avoid roads without bicycle access. |
 | `bus` | Standard costing for bus routes. Bus costing inherits the auto costing behaviors, but checks for bus access on the roads. |
+| `truck` | Standard costing for trucks. Truck costing inherits the auto costing behaviors, but checks for truck access, width and height restrictions, and weight limits on the roads. |
 | `hov` | Standard costing for high-occupancy vehicle (HOV) routes. HOV costing inherits the auto costing behaviors, but checks for HOV lane access on the roads and favors those roads.|
 | `taxi` | Standard costing for taxi routes. Taxi costing inherits the auto costing behaviors, but checks for taxi lane access on the roads and favors those roads.|
 | `motor_scooter` | Standard costing for travel by motor scooter or moped.  By default, motor_scooter costing will avoid higher class roads unless the country overrides allows motor scooters on these roads.  Motor scooter routes follow regular roads when needed, but avoid roads without motor_scooter, moped, or mofa access. |
@@ -84,7 +89,7 @@ Costing methods can have several options that can be adjusted to develop the rou
 
 ##### Automobile and bus costing options
 
-These options are available for `auto`, `auto_shorter`, and `bus` costing methods.
+These options are available for `auto`, `auto_shorter`, `bus`, and `truck` costing methods.
 
 | Automobile options | Description |
 | :-------------------------- | :----------- |
@@ -98,6 +103,19 @@ These options are available for `auto`, `auto_shorter`, and `bus` costing method
 | `use_tolls` | This value indicates the willingness to take roads with tolls. This is a range of values between 0 and 1. Values near 0 attempt to avoid tolls and values near 1 will not attempt to avoid them. The default value is 0.5. Note that sometimes roads with tolls are required to complete a route so values of 0 are not guaranteed to avoid them entirely. |
 | `country_crossing_cost` | A cost applied when encountering an international border. This cost is added to the estimated and elapsed times. The default cost is 600 seconds. |
 | `country_crossing_penalty` | A penalty applied for a country crossing. This penalty can be used to create paths that avoid spanning country boundaries. The default penalty is 0. |
+
+###### Truck-specific costing options
+
+In addition to the above, the following options are available for `truck` costing.
+
+| Truck options | Description |
+| :-------------------------- | :----------- |
+| `height` | The height of the truck (in meters). |
+| `width` | The width of the truck (in meters). |
+| `length` | The length of the truck (in meters). |
+| `weight` | The weight of the truck (in metric tons). |
+| `axle_load` | The axle load of the truck (in metric tons). |
+| `hazmat` | A value indicating if the truck is carrying hazardous materials. |
 
 ##### Bicycle costing options
 The default bicycle costing is tuned toward road bicycles with a slight preference for using [cycleways](http://wiki.openstreetmap.org/wiki/Key:cycleway) or roads with bicycle lanes. Bicycle routes use regular roads where needed or where no direct bicycle lane options exist, but avoid roads without bicycle access. The costing model recognizes several factors unique to bicycle travel and offers several options for tuning bicycle routes. Several factors unique to travel by bicycle influence the resulting route.
@@ -174,7 +192,7 @@ These options are available for transit costing when the multimodal costing mode
 When using `filters`, you need to include a [Onestop ID](https://transit.land/documentation/onestop-id-scheme/) to identify the stop, routes, or operators to include or exclude in your query. Depending on how you are interacting with transit data from Transitland, there are different ways of obtaining the Onestop ID.
 
 - Turn-by-Turn API: Query a transit route query and parse the returned JSON maneuver  for `transit_info` to find `operator_onestop_id` and the route `onestop_id`. A `transit_stop` contains the `onestop_id` for the stop.
-- [Mobility Explorer](https://github.com/transitland/mobility-explorer): Click a single route, stop, or operator on the map, or use the drop-down menu to find the Onestop ID for routes and operators. The Onestop ID, among other details, is listed in the sidebar. 
+- [Mobility Explorer](https://github.com/transitland/mobility-explorer): Click a single route, stop, or operator on the map, or use the drop-down menu to find the Onestop ID for routes and operators. The Onestop ID, among other details, is listed in the sidebar.
 - [Transitland](https://transit.land/): Use the Transitland Datastore API to query directly for stops, routes, and operators using a number of options. For example, you can filter for only [subway routes](http://transit.land/api/v1/routes?vehicle_type=metro) or [bus routes](http://transit.land/api/v1/routes?vehicle_type=bus). See the [Transitland Datastore API documentation](https://transit.land/documentation/datastore/api-endpoints.html) for details.
 
 ##### Sample JSON payloads for multimodal requests with transit
@@ -225,8 +243,10 @@ A multimodal request with a filter for certain Onestop IDs:
 | `fr-FR` | `fr` | French (France) |
 | `hi-IN` | `hi` | Hindi (India) |
 | `it-IT` | `it` | Italian (Italy) |
+| `ja-JP` | `ja` | Japanese (Japan) |
 | `pt-PT` | `pt` | Portuguese (Portugal) |
 | `ru-RU` | `ru` | Russian (Russia) |
+| `sk-SK` | `sk` | Slovak (Slovakia) |
 | `sl-SI` | `sl` | Slovenian (Slovenia) |
 | `sv-SE` | `sv` | Swedish (Sweden) |
 
@@ -343,6 +363,8 @@ kTransitConnectionStart = 33;
 kTransitConnectionTransfer = 34;
 kTransitConnectionDestination = 35;
 kPostTransitConnectionDestination = 36;
+kMergeRight = 37;
+kMergeLeft = 38;
 ```
 
 The maneuver `sign` may contain four lists of interchange sign elements as follows:
