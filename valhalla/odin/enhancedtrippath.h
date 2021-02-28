@@ -134,8 +134,12 @@ public:
     return mutable_edge_->name();
   }
 
-  float length() const {
-    return mutable_edge_->length();
+  const ::google::protobuf::RepeatedPtrField<::valhalla::TaggedName>& tagged_name() const {
+    return mutable_edge_->tagged_name();
+  }
+
+  float length_km() const {
+    return mutable_edge_->length_km();
   }
 
   float speed() const {
@@ -207,7 +211,6 @@ public:
   }
 
   ::valhalla::TripLeg_TransitType transit_type() const {
-    return mutable_edge_->transit_type();
     return mutable_edge_->transit_type();
   }
 
@@ -339,6 +342,22 @@ public:
     return mutable_edge_->mutable_turn_lanes();
   }
 
+  bool has_restriction() const {
+    return mutable_edge_->has_restriction();
+  }
+
+  bool destination_only() const {
+    return mutable_edge_->destination_only();
+  }
+
+  bool has_is_urban() const {
+    return mutable_edge_->has_is_urban();
+  }
+
+  bool is_urban() const {
+    return mutable_edge_->is_urban();
+  }
+
   bool IsUnnamed() const;
 
   // Use
@@ -360,6 +379,8 @@ public:
   bool IsPathUse() const;
   bool IsPedestrianUse() const;
   bool IsBridlewayUse() const;
+  bool IsRestAreaUse() const;
+  bool IsServiceAreaUse() const;
   bool IsOtherUse() const;
   bool IsFerryUse() const;
   bool IsRailFerryUse() const;
@@ -383,6 +404,8 @@ public:
 
   bool IsForward(uint32_t prev2curr_turn_degree) const;
 
+  bool IsForkForward(uint32_t prev2curr_turn_degree) const;
+
   bool IsWiderForward(uint32_t prev2curr_turn_degree) const;
 
   bool IsStraightest(uint32_t prev2curr_turn_degree, uint32_t straightest_xedge_turn_degree) const;
@@ -400,8 +423,10 @@ public:
                              const DirectionsLeg_Maneuver_Type& curr_maneuver_type,
                              const DirectionsLeg_Maneuver_Type& next_maneuver_type);
   uint16_t ActivateTurnLanesFromLeft(uint16_t turn_lane_direction,
+                                     const DirectionsLeg_Maneuver_Type& curr_maneuver_type,
                                      uint16_t activated_max = std::numeric_limits<uint16_t>::max());
   uint16_t ActivateTurnLanesFromRight(uint16_t turn_lane_direction,
+                                      const DirectionsLeg_Maneuver_Type& curr_maneuver_type,
                                       uint16_t activated_max = std::numeric_limits<uint16_t>::max());
 
   std::string ToString() const;
@@ -481,6 +506,9 @@ public:
   std::string ToString() const;
 
 protected:
+  ::valhalla::TripLeg_Traversability
+  GetTravelModeTraversability(const TripLeg_TravelMode travel_mode) const;
+
   TripLeg_IntersectingEdge* mutable_intersecting_edge_;
 };
 
@@ -562,7 +590,11 @@ public:
   }
 
   double elapsed_time() const {
-    return mutable_node_->elapsed_time();
+    return mutable_node_->cost().elapsed_cost().seconds();
+  }
+
+  bool has_admin_index() const {
+    return mutable_node_->has_admin_index();
   }
 
   uint32_t admin_index() const {
@@ -577,12 +609,16 @@ public:
     return mutable_node_->time_zone();
   }
 
-  bool has_transition_time() const {
-    return mutable_node_->has_transition_time();
+  TripLeg::PathCost cost() const {
+    return mutable_node_->cost();
   }
 
-  double transition_time() const {
-    return mutable_node_->transition_time();
+  const google::protobuf::RepeatedPtrField<TripLeg::PathCost> recosts() const {
+    return mutable_node_->recosts();
+  }
+
+  bool HasBssInfo() const {
+    return mutable_node_->has_bss_info();
   }
 
   bool HasIntersectingEdges() const;
@@ -590,6 +626,21 @@ public:
   bool HasIntersectingEdgeNameConsistency() const;
 
   bool HasIntersectingEdgeCurrNameConsistency() const;
+
+  /**
+   * Returns true if there is an non-backward traversable intersecting edge ramp with the same name
+   * as the previous and/or current edges at this node along the route path.
+   * Non-backward is so we do not consider edges in the reverse direction of the route path.
+   *
+   * @param from_heading the previous edge end heading.
+   * @param travel_mode the travel mode at the node in the route path - examples:
+   *                       kDrive, kPedestrian, kBicycle, kTransit
+   *
+   * @return true if there is an non-backward traversable intersecting edge ramp with the same name
+   * as the previous and/or current edges at this node along the route path.
+   */
+  bool HasNonBackwardTraversableSameNameRampIntersectingEdge(uint32_t from_heading,
+                                                             const TripLeg_TravelMode travel_mode);
 
   std::unique_ptr<EnhancedTripLeg_IntersectingEdge> GetIntersectingEdge(size_t index);
 
@@ -606,11 +657,30 @@ public:
                                                       const TripLeg_TravelMode travel_mode,
                                                       RoadClass path_road_class);
 
+  bool HasForwardTraversableUseXEdge(uint32_t from_heading,
+                                     const TripLeg_TravelMode travel_mode,
+                                     const TripLeg_Use use);
+
+  bool HasSimilarStraightSignificantRoadClassXEdge(uint32_t path_turn_degree,
+                                                   uint32_t from_heading,
+                                                   const TripLeg_TravelMode travel_mode,
+                                                   RoadClass path_road_class);
+
+  bool HasSimilarStraightNonRampOrSameNameRampXEdge(uint32_t path_turn_degree,
+                                                    uint32_t from_heading,
+                                                    const TripLeg_TravelMode travel_mode);
+
+  bool HasOnlyForwardTraversableRoadClassXEdges(uint32_t from_heading,
+                                                const TripLeg_TravelMode travel_mode,
+                                                RoadClass path_road_class);
+
   bool HasWiderForwardTraversableIntersectingEdge(uint32_t from_heading,
                                                   const TripLeg_TravelMode travel_mode);
 
   bool HasWiderForwardTraversableHighwayXEdge(uint32_t from_heading,
                                               const TripLeg_TravelMode travel_mode);
+
+  bool HasTraversableIntersectingEdge(const TripLeg_TravelMode travel_mode);
 
   bool HasTraversableOutboundIntersectingEdge(const TripLeg_TravelMode travel_mode);
 
@@ -649,6 +719,8 @@ public:
   bool IsParking() const;
   bool IsMotorwayJunction() const;
   bool IsBorderControl() const;
+  bool IsTollGantry() const;
+  bool IsSumpBuster() const;
 
   std::string ToString() const;
 

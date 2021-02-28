@@ -13,6 +13,17 @@ set(sources
   transit_available_action.cc
   node_search.cc)
 
+if (UNIX AND NOT APPLE)
+  # Enables stricter compiler checks on a file-by-file basis
+  # which allows us to migrate piecemeal
+  set_source_files_properties(
+    search.cc
+    worker.cc
+    locate_action.cc
+    height_action.cc
+  PROPERTIES COMPILE_FLAGS "-Wall -Werror")
+endif ()
+
 valhalla_module(NAME loki
   SOURCES ${sources}
   HEADERS ${headers}
@@ -21,7 +32,7 @@ valhalla_module(NAME loki
       ${VALHALLA_SOURCE_DIR}
       ${VALHALLA_SOURCE_DIR}/valhalla
       ${VALHALLA_SOURCE_DIR}/third_party/date/include
-      $<$<BOOL:${MSVC}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
+      $<$<BOOL:${WIN32}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
     PRIVATE
       ${VALHALLA_SOURCE_DIR}/third_party/rapidjson/include
       ${CMAKE_BINARY_DIR}
@@ -31,5 +42,4 @@ valhalla_module(NAME loki
     valhalla::proto
     ${valhalla_protobuf_targets}
     Boost::boost
-    libprime_server
-    robin_hood::robin_hood)
+    libprime_server)

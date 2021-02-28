@@ -46,9 +46,9 @@ struct HGVRestrictionTypes {
 // Get the GraphId of the opposing edge.
 uint32_t GetOpposingEdgeIndex(const GraphId& startnode,
                               DirectedEdge& edge,
-                              uint32_t wayid,
-                              const GraphTile* tile,
-                              const GraphTile* end_tile,
+                              uint64_t wayid,
+                              const graph_tile_ptr& tile,
+                              const graph_tile_ptr& end_tile,
                               std::set<uint32_t>& problem_ways,
                               uint32_t& dupcount,
                               std::string& endnodeiso,
@@ -135,7 +135,7 @@ uint32_t GetOpposingEdgeIndex(const GraphId& startnode,
       }
 
       bool match = false;
-      uint32_t wayid2 = 0;
+      uint64_t wayid2 = 0;
       if (edge.is_shortcut()) {
         // Shortcut edges - use must match (or both are links)
         if ((directededge->link() && edge.link()) || (directededge->use() == edge.use())) {
@@ -258,7 +258,7 @@ void validate(
   GraphReader graph_reader(pt.get_child("mjolnir"));
   // Get some things we need throughout
   auto numLevels = TileHierarchy::levels().size() + 1; // To account for transit
-  auto transit_level = TileHierarchy::levels().rbegin()->second.level + 1;
+  auto transit_level = TileHierarchy::GetTransitLevel().level;
 
   // vector to hold densities for each level
   std::vector<std::vector<float>> densities(numLevels);
@@ -282,13 +282,10 @@ void validate(
     lock.unlock();
 
     // Point tiles to the set we need for current level
+    const auto& tiles = tile_id.level() == TileHierarchy::GetTransitLevel().level
+                            ? TileHierarchy::levels().back().tiles
+                            : TileHierarchy::levels()[tile_id.level()].tiles;
     auto level = tile_id.level();
-    if (TileHierarchy::levels().rbegin()->second.level + 1 == level) {
-      level = TileHierarchy::levels().rbegin()->second.level;
-    }
-
-    const auto& tiles = TileHierarchy::levels().find(level)->second.tiles;
-    level = tile_id.level();
     auto tileid = tile_id.tileid();
 
     // Get the tile
@@ -300,7 +297,7 @@ void validate(
 
     // Get this tile
     lock.lock();
-    const GraphTile* tile = graph_reader.GetGraphTile(tile_id);
+    graph_tile_ptr tile = graph_reader.GetGraphTile(tile_id);
     lock.unlock();
 
     // Iterate through the nodes and the directed edges
@@ -366,16 +363,12 @@ void validate(
         DirectedEdge& directededge = tilebuilder.directededge(nodeinfo.edge_index() + j);
 
         // Road Length and some variables for statistics
-        float edge_length;
-        bool valid_length = false;
         if (!directededge.shortcut()) {
-          edge_length = directededge.length();
-          roadlength += edge_length;
-          valid_length = true;
+          roadlength += directededge.length();
         }
 
         // Check if end node is in a different tile
-        const GraphTile* endnode_tile = tile;
+        graph_tile_ptr endnode_tile = tile;
         if (tile_id != directededge.endnode().Tile_Base()) {
           directededge.set_leaves_tile(true);
 
@@ -392,14 +385,14 @@ void validate(
         // node. Set the deadend flag and internal flag (if the opposing
         // edge is internal then make sure this edge is as well)
         std::string end_node_iso;
-        uint32_t wayid = tile->edgeinfo(directededge.edgeinfo_offset()).wayid();
+        uint64_t wayid = tile->edgeinfo(directededge.edgeinfo_offset()).wayid();
         uint32_t opp_index =
             GetOpposingEdgeIndex(node, directededge, wayid, tile, endnode_tile, problem_ways,
                                  dupcount, end_node_iso, transit_level);
         directededge.set_opp_index(opp_index);
         if (directededge.use() == Use::kTransitConnection ||
             directededge.use() == Use::kEgressConnection ||
-            directededge.use() == Use::kPlatformConnection) {
+            directededge.use() == Use::kPlatformConnection || directededge.bss_connection()) {
           directededge.set_opp_local_idx(opp_index);
         }
 
@@ -444,7 +437,7 @@ void validate(
     AABB2<PointLL> bb = tiles.TileBounds(tileid);
     float area = ((bb.maxy() - bb.miny()) * kMetersPerDegreeLat * kKmPerMeter) *
                  ((bb.maxx() - bb.minx()) *
-                  DistanceApproximator::MetersPerLngDegree(bb.Center().y()) * kKmPerMeter);
+                  DistanceApproximator<PointLL>::MetersPerLngDegree(bb.Center().y()) * kKmPerMeter);
     float density = (roadlength * 0.0005f) / area;
     densities[level].push_back(density);
 
@@ -467,9 +460,9 @@ void validate(
     tilebuilder.Update(nodes, directededges);
 
     // Write the bins to it
-    if (tile->header()->graphid().level() == TileHierarchy::levels().rbegin()->first) {
-      auto reloaded = GraphTile(graph_reader.tile_dir(), tile_id);
-      GraphTileBuilder::AddBins(graph_reader.tile_dir(), &reloaded, bins);
+    if (tile->header()->graphid().level() == TileHierarchy::levels().back().level) {
+      auto reloaded = GraphTile::Create(graph_reader.tile_dir(), tile_id);
+      GraphTileBuilder::AddBins(graph_reader.tile_dir(), reloaded, bins);
     }
 
     // Check if we need to clear the tile cache
@@ -526,17 +519,18 @@ void bin_tweeners(const std::string& tile_dir,
     ++start;
     lock.unlock();
 
-    // if there is nothing there we need to make something
-    GraphTile tile(tile_dir, tile_bin.first);
-
-    if (!tile.header()) {
+    // some tiles are just there because edges' shapes passes through them (no edges/nodes, just bins)
+    // if that's the case we need to make a tile to store the spatial index (binned edges) there
+    auto tile = GraphTile::Create(tile_dir, tile_bin.first);
+    if (!tile) {
       GraphTileBuilder empty(tile_dir, tile_bin.first, false);
       empty.header_builder().set_dataset_id(dataset_id);
       empty.StoreTileData();
-      tile = GraphTile(tile_dir, tile_bin.first);
+      tile = GraphTile::Create(tile_dir, tile_bin.first);
     }
+
     // keep the extra binned edges
-    GraphTileBuilder::AddBins(tile_dir, &tile, tile_bin.second);
+    GraphTileBuilder::AddBins(tile_dir, tile, tile_bin.second);
   }
 }
 } // namespace
@@ -556,10 +550,13 @@ void GraphValidator::Validate(const boost::property_tree::ptree& pt) {
   for (const auto& id : tileset) {
     tilequeue.emplace_back(id);
   }
-  std::random_shuffle(tilequeue.begin(), tilequeue.end());
+  // fixed seed for reproducible tile build
+  std::shuffle(tilequeue.begin(), tilequeue.end(), std::mt19937(3));
 
   // Remember what the dataset id is in case we have to make some tiles
-  auto dataset_id = GraphTile(tile_dir, *tilequeue.begin()).header()->dataset_id();
+  graph_tile_ptr first_tile = GraphTile::Create(tile_dir, *tilequeue.begin());
+  assert(tilequeue.size() && first_tile);
+  auto dataset_id = first_tile->header()->dataset_id();
 
   // An mutex we can use to do the synchronization
   std::mutex lock;
@@ -567,7 +564,7 @@ void GraphValidator::Validate(const boost::property_tree::ptree& pt) {
   // Setup threads
   std::vector<std::shared_ptr<std::thread>> threads(
       std::max(static_cast<unsigned int>(1),
-               pt.get<unsigned int>("concurrency", std::thread::hardware_concurrency())));
+               pt.get<unsigned int>("mjolnir.concurrency", std::thread::hardware_concurrency())));
 
   // Setup promises
   std::list<
@@ -622,6 +619,9 @@ void GraphValidator::Validate(const boost::property_tree::ptree& pt) {
     LOG_WARN((boost::format("Possible duplicates at level: %1% = %2%") % std::to_string(level) %
               duplicates[level])
                  .str());
+    if (densities[level].empty()) {
+      continue;
+    }
     // Get the average density and the max density
     float max_density = 0.0f;
     float sum = 0.0f;

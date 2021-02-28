@@ -1,5 +1,5 @@
 #include "mjolnir/ferry_connections.h"
-#include <valhalla/mjolnir/node_expander.h>
+#include "mjolnir/node_expander.h"
 
 #include <list>
 #include <queue>
@@ -58,7 +58,7 @@ bool IsTurnChannel(sequence<OSMWay>& ways,
     std::list<PointLL> shape;
     for (size_t i = 0; i < count; ++i) {
       auto node = (*way_nodes[idx++]).node;
-      shape.emplace_back(node.lng_, node.lat_);
+      shape.emplace_back(node.latlng());
     }
     return shape;
   };

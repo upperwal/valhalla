@@ -25,8 +25,8 @@
 #include <thread>
 
 #include "config.h"
-#include <valhalla/proto/segment.pb.h>
-#include <valhalla/proto/tile.pb.h>
+#include "proto/segment.pb.h"
+#include "proto/tile.pb.h"
 
 namespace vm = valhalla::midgard;
 namespace vb = valhalla::baldr;
@@ -284,8 +284,7 @@ public:
                       const uint32_t tz_index) const;
   bool Allowed(const vb::NodeInfo* node) const;
   vs::Cost EdgeCost(const vb::DirectedEdge* edge, const uint32_t speed) const;
-  vs::EdgeFilter GetEdgeFilter() const;
-  vs::NodeFilter GetNodeFilter() const;
+  float Filter(const vb::DirectedEdge* edge) const override;
   float AStarCostFactor() const;
 };
 
@@ -330,12 +329,8 @@ vs::Cost DistanceOnlyCost::EdgeCost(const vb::DirectedEdge* edge, const uint32_t
   return {edge_len, edge_len};
 }
 
-vs::EdgeFilter DistanceOnlyCost::GetEdgeFilter() const {
-  return [](const vb::DirectedEdge* edge) -> float { return allow_edge_pred(edge) ? 1.0f : 0.0f; };
-}
-
-vs::NodeFilter DistanceOnlyCost::GetNodeFilter() const {
-  return [](const vb::NodeInfo*) -> bool { return false; };
+float DistanceOnlyCost::Filter(const baldr::DirectedEdge* edge) const {
+  return allow_edge_pred(edge) ? 1.0f : 0.0f;
 }
 
 float DistanceOnlyCost::AStarCostFactor() const {
@@ -401,7 +396,7 @@ private:
 std::vector<vb::GraphId>
 find_nearby_nodes(vb::GraphReader& reader, const vm::PointLL& pt, const uint8_t level) {
   // Create a bounding box and find nodes within the bounding box
-  float meters_per_lng = vm::DistanceApproximator::MetersPerLngDegree(pt.lat());
+  float meters_per_lng = vm::DistanceApproximator<vm::PointLL>::MetersPerLngDegree(pt.lat());
   float delta_lng = kNodeDistanceTolerance / meters_per_lng;
   float delta_lat = kNodeDistanceTolerance / vm::kMetersPerDegreeLat;
   vm::AABB2<vm::PointLL> bbox({pt.lng() - delta_lng, pt.lat() - delta_lat},
@@ -721,7 +716,7 @@ std::vector<EdgeMatch> edge_association::match_edges(const pbf::Segment& segment
     // Add edges to the matched path.
     // TODO - remove duplicate instances of the edge ID in the path info.
     for (const auto& info : path) {
-      const GraphTile* tile = m_reader.GetGraphTile(info.edgeid);
+      graph_tile_ptr tile = m_reader.GetGraphTile(info.edgeid);
       const DirectedEdge* edge = tile->directededge(info.edgeid);
       edges.emplace_back(EdgeMatch{info.edgeid, edge->length(), 0.0f,
                                    1.0f}); // TODO - set first and last edge full_edge flag

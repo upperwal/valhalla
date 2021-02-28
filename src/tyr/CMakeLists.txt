@@ -20,7 +20,7 @@ valhalla_module(NAME tyr
       ${VALHALLA_SOURCE_DIR}
       ${VALHALLA_SOURCE_DIR}/valhalla
       ${VALHALLA_SOURCE_DIR}/third_party/date/include
-      $<$<BOOL:${MSVC}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
+      $<$<BOOL:${WIN32}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
     PRIVATE
       ${VALHALLA_SOURCE_DIR}/third_party/rapidjson/include
       ${CMAKE_BINARY_DIR}
@@ -30,5 +30,4 @@ valhalla_module(NAME tyr
     valhalla::odin
     valhalla::proto
     ${valhalla_protobuf_targets}
-    Boost::boost
-    robin_hood::robin_hood)
+    Boost::boost)

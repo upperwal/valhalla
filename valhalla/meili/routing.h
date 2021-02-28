@@ -13,6 +13,7 @@
 #include <valhalla/baldr/graphreader.h>
 #include <valhalla/baldr/pathlocation.h>
 #include <valhalla/midgard/distanceapproximator.h>
+#include <valhalla/midgard/pointll.h>
 #include <valhalla/sif/costconstants.h>
 #include <valhalla/sif/dynamiccost.h>
 #include <valhalla/sif/edgelabel.h>
@@ -30,8 +31,6 @@ constexpr uint16_t kInvalidDestination = std::numeric_limits<uint16_t>::max();
 class Label : public sif::EdgeLabel {
 public:
   Label() {
-    // zero out the data but set the node Id and edge Id to invalid
-    memset(this, 0, sizeof(Label));
     nodeid_ = baldr::GraphId();
     edgeid_ = baldr::GraphId();
     predecessor_ = baldr::kInvalidLabel;
@@ -50,8 +49,20 @@ public:
         float sortcost,
         const uint32_t predecessor,
         const baldr::DirectedEdge* edge,
-        const sif::TravelMode mode)
-      : sif::EdgeLabel(predecessor, edgeid, edge, cost, sortcost, 0.0f, mode, 0, sif::Cost{}),
+        const sif::TravelMode mode,
+        int restriction_idx)
+      : sif::EdgeLabel(predecessor,
+                       edgeid,
+                       edge,
+                       cost,
+                       sortcost,
+                       0.0f,
+                       mode,
+                       0,
+                       sif::Cost{},
+                       restriction_idx,
+                       true,
+                       false),
         nodeid_(nodeid), dest_(dest), source_(source), target_(target), turn_cost_(turn_cost) {
     // Validate inputs
     if (!(0.f <= source && source <= target && target <= 1.f)) {
@@ -62,7 +73,7 @@ public:
       throw std::invalid_argument("invalid cost = " + std::to_string(cost.cost));
     }
     if (turn_cost < 0.f) {
-      throw std::invalid_argument("invalid turn_cost = " + std::to_string(turn_cost));
+      throw std::invalid_argument("invalid transition_time = " + std::to_string(turn_cost));
     }
   }
 
@@ -169,7 +180,7 @@ public:
       dest_status_.emplace(dest, idx);
       labels_.emplace_back(edgelabel ? *edgelabel : Label());
       labels_.back().InitAsOrigin(mode, dest, {});
-      queue_->add(idx);
+      queue_.add(idx);
     }
   }
 
@@ -186,7 +197,7 @@ public:
       node_status_.emplace(nodeid, idx);
       labels_.emplace_back(edgelabel ? *edgelabel : Label());
       labels_.back().InitAsOrigin(mode, kInvalidDestination, nodeid);
-      queue_->add(idx);
+      queue_.add(idx);
     }
   }
 
@@ -202,7 +213,8 @@ public:
            const float sortcost,
            const uint32_t predecessor,
            const baldr::DirectedEdge* edge,
-           const sif::TravelMode mode);
+           const sif::TravelMode mode,
+           int restriction_idx);
 
   /**
    * Add a label with an edge and a destination index.
@@ -216,7 +228,8 @@ public:
            const float sortcost,
            const uint32_t predecessor,
            const baldr::DirectedEdge* edge,
-           const sif::TravelMode mode);
+           const sif::TravelMode mode,
+           int restriction_idx);
 
   /**
    * Get the next label from the priority queue. Marks the popped label
@@ -238,7 +251,7 @@ public:
    * Clear the priority queue.
    */
   void clear_queue() {
-    queue_->clear();
+    queue_.clear();
   }
 
   /**
@@ -250,7 +263,7 @@ public:
   }
 
 private:
-  std::shared_ptr<baldr::DoubleBucketQueue> queue_;        // Priority queue
+  baldr::DoubleBucketQueue<Label> queue_;                  // Priority queue
   std::unordered_map<baldr::GraphId, Status> node_status_; // Node status
   std::unordered_map<uint16_t, Status> dest_status_;       // Destination status
   std::vector<Label> labels_;                              // Label list.
@@ -282,7 +295,7 @@ find_shortest_path(baldr::GraphReader& reader,
                    const std::vector<baldr::PathLocation>& destinations,
                    uint16_t origin_idx,
                    labelset_ptr_t labelset,
-                   const midgard::DistanceApproximator& approximator,
+                   const midgard::DistanceApproximator<midgard::PointLL>& approximator,
                    const float search_radius,
                    sif::cost_ptr_t costing,
                    const Label* edgelabel,

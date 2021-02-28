@@ -12,7 +12,7 @@ using namespace valhalla::sif;
 namespace {
 
 // Method to get an operator Id from a map of operator strings vs. Id.
-uint32_t GetOperatorId(const GraphTile* tile,
+uint32_t GetOperatorId(const graph_tile_ptr& tile,
                        uint32_t routeid,
                        std::unordered_map<std::string, uint32_t>& operators) {
   const TransitRoute* transit_route = tile->GetTransitRoute(routeid);
@@ -40,40 +40,55 @@ namespace valhalla {
 namespace thor {
 
 // Default constructor
-Dijkstras::Dijkstras()
-    : access_mode_(kAutoAccess), mode_(TravelMode::kDrive), adjacencylist_(nullptr) {
+Dijkstras::Dijkstras(uint32_t max_reserved_labels_count)
+    : mode_(TravelMode::kDrive), access_mode_(kAutoAccess),
+      max_reserved_labels_count_(max_reserved_labels_count), multipath_(false) {
 }
 
 // Clear the temporary information generated during path construction.
 void Dijkstras::Clear() {
   // Clear the edge labels, edge status flags, and adjacency list
   // TODO - clear only the edge label set that was used?
+  if (bdedgelabels_.size() > max_reserved_labels_count_) {
+    bdedgelabels_.resize(max_reserved_labels_count_);
+    bdedgelabels_.shrink_to_fit();
+  }
   bdedgelabels_.clear();
+
+  if (mmedgelabels_.size() > max_reserved_labels_count_) {
+    mmedgelabels_.resize(max_reserved_labels_count_);
+    mmedgelabels_.shrink_to_fit();
+  }
   mmedgelabels_.clear();
-  adjacencylist_.reset();
+
+  adjacencylist_.clear();
+  mmadjacencylist_.clear();
   edgestatus_.clear();
 }
 
 // Initialize - create adjacency list, edgestatus support, and reserve
 // edgelabels
 template <typename label_container_t>
-void Dijkstras::Initialize(label_container_t& labels, const uint32_t bucket_size) {
+void Dijkstras::Initialize(label_container_t& labels,
+                           baldr::DoubleBucketQueue<typename label_container_t::value_type>& queue,
+                           const uint32_t bucket_size) {
   // Set aside some space for edge labels
   uint32_t edge_label_reservation;
   uint32_t bucket_count;
   GetExpansionHints(bucket_count, edge_label_reservation);
-  labels.reserve(edge_label_reservation);
+  labels.reserve(std::min(max_reserved_labels_count_, edge_label_reservation));
 
   // Set up lambda to get sort costs
-  const auto edgecost = [&labels](const uint32_t label) { return labels[label].sortcost(); };
   float range = bucket_count * bucket_size;
-  adjacencylist_.reset(new DoubleBucketQueue(0.0f, range, bucket_size, edgecost));
+  queue.reuse(0.0f, range, bucket_size, &labels);
 }
 template void
 Dijkstras::Initialize<decltype(Dijkstras::bdedgelabels_)>(decltype(Dijkstras::bdedgelabels_)&,
+                                                          baldr::DoubleBucketQueue<sif::BDEdgeLabel>&,
                                                           const uint32_t);
 template void
 Dijkstras::Initialize<decltype(Dijkstras::mmedgelabels_)>(decltype(Dijkstras::mmedgelabels_)&,
+                                                          baldr::DoubleBucketQueue<sif::MMEdgeLabel>&,
                                                           const uint32_t);
 
 // Initializes the time of the expansion if there is one
@@ -99,7 +114,7 @@ void Dijkstras::ExpandForward(GraphReader& graphreader,
                               const TimeInfo& time_info) {
   // Get the tile and the node info. Skip if tile is null (can happen
   // with regional data sets) or if no access at the node.
-  const GraphTile* tile = graphreader.GetGraphTile(node);
+  graph_tile_ptr tile = graphreader.GetGraphTile(node);
   if (tile == nullptr) {
     return;
   }
@@ -109,7 +124,7 @@ void Dijkstras::ExpandForward(GraphReader& graphreader,
 
   // We dont need to do transitions again we just need to queue the edges that leave them
   if (!from_transition) {
-    // Let implementing class we are expanding from here
+    // Let implementing class know we are expanding from here
     EdgeLabel* prev_pred =
         pred.predecessor() == kInvalidLabel ? nullptr : &bdedgelabels_[pred.predecessor()];
     ExpandingNode(graphreader, tile, nodeinfo, pred, prev_pred);
@@ -127,7 +142,7 @@ void Dijkstras::ExpandForward(GraphReader& graphreader,
 
   // Expand from end node in forward direction.
   GraphId edgeid = {node.tileid(), node.level(), nodeinfo->edge_index()};
-  EdgeStatusInfo* es = edgestatus_.GetPtr(edgeid, tile);
+  EdgeStatusInfo* es = edgestatus_.GetPtr(edgeid, tile, pred.path_id());
   const DirectedEdge* directededge = tile->directededge(edgeid);
   for (uint32_t i = 0; i < nodeinfo->edge_count(); ++i, ++directededge, ++edgeid, ++es) {
     // Skip this edge if permanently labeled (best path already found to this
@@ -141,53 +156,56 @@ void Dijkstras::ExpandForward(GraphReader& graphreader,
 
     // Check if the edge is allowed or if a restriction occurs
     EdgeStatus* todo = nullptr;
-    bool has_time_restrictions = false;
+    uint8_t restriction_idx = -1;
     if (offset_time.valid) {
       // With date time we check time dependent restrictions and access
       if (!costing_->Allowed(directededge, pred, tile, edgeid, offset_time.local_time,
-                             nodeinfo->timezone(), has_time_restrictions) ||
+                             nodeinfo->timezone(), restriction_idx) ||
           costing_->Restricted(directededge, pred, bdedgelabels_, tile, edgeid, true, todo,
                                offset_time.local_time, nodeinfo->timezone())) {
         continue;
       }
     } else {
-      if (!costing_->Allowed(directededge, pred, tile, edgeid, 0, 0, has_time_restrictions) ||
+      if (!costing_->Allowed(directededge, pred, tile, edgeid, 0, 0, restriction_idx) ||
           costing_->Restricted(directededge, pred, bdedgelabels_, tile, edgeid, true)) {
         continue;
       }
     }
 
-    // Compute the cost to the end of this edge
+    // Compute the cost and path distance to the end of this edge
     Cost transition_cost = costing_->TransitionCost(directededge, nodeinfo, pred);
+    uint8_t flow_sources;
     Cost newcost = pred.cost() +
-                   costing_->EdgeCost(directededge, tile,
-                                      offset_time.valid ? offset_time.second_of_week
-                                                        : kConstrainedFlowSecondOfDay) +
+                   costing_->EdgeCost(directededge, tile, offset_time.second_of_week, flow_sources) +
                    transition_cost;
+    uint32_t path_dist = pred.path_distance() + directededge->length();
 
     // Check if edge is temporarily labeled and this path has less cost. If
     // less cost the predecessor is updated and the sort cost is decremented
     // by the difference in real cost (A* heuristic doesn't change)
     if (es->set() == EdgeSet::kTemporary) {
-      EdgeLabel& lab = bdedgelabels_[es->index()];
+      BDEdgeLabel& lab = bdedgelabels_[es->index()];
       if (newcost.cost < lab.cost().cost) {
         float newsortcost = lab.sortcost() - (lab.cost().cost - newcost.cost);
-        adjacencylist_->decrease(es->index(), newsortcost);
-        lab.Update(pred_idx, newcost, newsortcost, transition_cost, has_time_restrictions);
+        adjacencylist_.decrease(es->index(), newsortcost);
+        lab.Update(pred_idx, newcost, newsortcost, transition_cost, path_dist, restriction_idx);
       }
       continue;
     }
 
     // Only needed if you want to connect with a reverse path
-    const GraphTile* t2 = tile;
+    graph_tile_ptr t2 = tile;
     GraphId oppedgeid = graphreader.GetOpposingEdgeId(edgeid, t2);
 
     // Add edge label, add to the adjacency list and set edge status
     uint32_t idx = bdedgelabels_.size();
     *es = {EdgeSet::kTemporary, idx};
-    bdedgelabels_.emplace_back(pred_idx, edgeid, oppedgeid, directededge, newcost, newcost.cost, 0.0f,
-                               mode_, transition_cost, false, has_time_restrictions);
-    adjacencylist_->add(idx);
+    bdedgelabels_.emplace_back(pred_idx, edgeid, oppedgeid, directededge, newcost, mode_,
+                               transition_cost, path_dist, false,
+                               (pred.closure_pruning() || !costing_->IsClosed(directededge, tile)),
+                               static_cast<bool>(flow_sources & kDefaultFlowMask), restriction_idx,
+                               pred.path_id());
+    adjacencylist_.add(idx);
   }
 
   // Handle transitions - expand from the end node of each transition
@@ -199,10 +217,33 @@ void Dijkstras::ExpandForward(GraphReader& graphreader,
   }
 }
 
+// performs one of the types of expansions
+// TODO: reduce code duplication between forward, reverse and multimodal as they are nearly identical
+void Dijkstras::Expand(ExpansionType expansion_type,
+                       valhalla::Api& api,
+                       baldr::GraphReader& reader,
+                       const sif::mode_costing_t& costings,
+                       const sif::TravelMode mode) {
+  // compute the expansion
+  switch (expansion_type) {
+    case ExpansionType::forward:
+      Compute(*api.mutable_options()->mutable_locations(), reader, costings, mode);
+      break;
+    case ExpansionType::reverse:
+      Compute(*api.mutable_options()->mutable_locations(), reader, costings, mode);
+      break;
+    case ExpansionType::multimodal:
+      Compute(*api.mutable_options()->mutable_locations(), reader, costings, mode);
+      break;
+    default:
+      throw std::runtime_error("Unknown expansion type");
+  }
+}
+
 // Compute the forward graph traversal
 void Dijkstras::Compute(google::protobuf::RepeatedPtrField<valhalla::Location>& origin_locations,
                         GraphReader& graphreader,
-                        const std::shared_ptr<DynamicCost>* mode_costing,
+                        const sif::mode_costing_t& mode_costing,
                         const TravelMode mode) {
 
   // Set the mode and costing
@@ -211,7 +252,7 @@ void Dijkstras::Compute(google::protobuf::RepeatedPtrField<valhalla::Location>& 
   access_mode_ = costing_->access_mode();
 
   // Prepare for a graph traversal
-  Initialize(bdedgelabels_, costing_->UnitSize());
+  Initialize(bdedgelabels_, adjacencylist_, costing_->UnitSize());
   SetOriginLocations(graphreader, origin_locations, costing_);
 
   // Get the time information for all the origin locations
@@ -222,17 +263,17 @@ void Dijkstras::Compute(google::protobuf::RepeatedPtrField<valhalla::Location>& 
   while (cb_decision != ExpansionRecommendation::stop_expansion) {
     // Get next element from adjacency list. Check that it is valid. An
     // invalid label indicates there are no edges that can be expanded.
-    uint32_t predindex = adjacencylist_->pop();
+    uint32_t predindex = adjacencylist_.pop();
     if (predindex == kInvalidLabel) {
       break;
     }
 
     // Copy the EdgeLabel for use in costing and settle the edge.
     EdgeLabel pred = bdedgelabels_[predindex];
-    edgestatus_.Update(pred.edgeid(), EdgeSet::kPermanent);
+    edgestatus_.Update(pred.edgeid(), EdgeSet::kPermanent, pred.path_id());
 
     // Check if we should stop
-    cb_decision = ShouldExpand(graphreader, pred, InfoRoutingType::forward);
+    cb_decision = ShouldExpand(graphreader, pred, ExpansionType::forward);
     if (cb_decision != ExpansionRecommendation::prune_expansion) {
       // Expand from the end node in forward direction.
       ExpandForward(graphreader, pred.endnode(), pred, predindex, false, time_infos.front());
@@ -250,7 +291,7 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
                               const TimeInfo& time_info) {
   // Get the tile and the node info. Skip if tile is null (can happen
   // with regional data sets) or if no access at the node.
-  const GraphTile* tile = graphreader.GetGraphTile(node);
+  graph_tile_ptr tile = graphreader.GetGraphTile(node);
   if (tile == nullptr) {
     return;
   }
@@ -260,7 +301,7 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
 
   // We dont need to do transitions again we just need to queue the edges that leave them
   if (!from_transition) {
-    // Let implementing class we are expanding from here
+    // Let implementing class know we are expanding from here
     EdgeLabel* prev_pred =
         pred.predecessor() == kInvalidLabel ? nullptr : &bdedgelabels_[pred.predecessor()];
     ExpandingNode(graphreader, tile, nodeinfo, pred, prev_pred);
@@ -278,7 +319,7 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
 
   // Expand from end node in reverse direction.
   GraphId edgeid = {node.tileid(), node.level(), nodeinfo->edge_index()};
-  EdgeStatusInfo* es = edgestatus_.GetPtr(edgeid, tile);
+  EdgeStatusInfo* es = edgestatus_.GetPtr(edgeid, tile, pred.path_id());
   const DirectedEdge* directededge = tile->directededge(edgeid);
   for (uint32_t i = 0; i < nodeinfo->edge_count(); ++i, ++directededge, ++edgeid, ++es) {
     // Skip this edge if permanently labeled (best path already found to this
@@ -289,7 +330,7 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
     }
 
     // Get end node tile, opposing edge Id, and opposing directed edge.
-    const GraphTile* t2 = tile;
+    graph_tile_ptr t2 = tile;
     auto opp_edge_id = graphreader.GetOpposingEdgeId(edgeid, t2);
     if (t2 == nullptr) {
       continue;
@@ -298,31 +339,32 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
 
     // Check if the edge is allowed or if a restriction occurs
     EdgeStatus* todo = nullptr;
-    bool has_time_restrictions = false;
+    uint8_t restriction_idx = -1;
     if (offset_time.valid) {
       // With date time we check time dependent restrictions and access
       if (!costing_->AllowedReverse(directededge, pred, opp_edge, t2, opp_edge_id,
-                                    offset_time.local_time, nodeinfo->timezone(),
-                                    has_time_restrictions) ||
+                                    offset_time.local_time, nodeinfo->timezone(), restriction_idx) ||
           costing_->Restricted(directededge, pred, bdedgelabels_, tile, edgeid, false, todo,
                                offset_time.local_time, nodeinfo->timezone())) {
         continue;
       }
     } else {
       if (!costing_->AllowedReverse(directededge, pred, opp_edge, t2, opp_edge_id, 0, 0,
-                                    has_time_restrictions) ||
+                                    restriction_idx) ||
           costing_->Restricted(directededge, pred, bdedgelabels_, tile, edgeid, false)) {
         continue;
       }
     }
 
     // Compute the cost to the end of this edge with separate transition cost
-    Cost transition_cost = costing_->TransitionCostReverse(directededge->localedgeidx(), nodeinfo,
-                                                           opp_edge, opp_pred_edge);
-    Cost newcost = pred.cost() + costing_->EdgeCost(opp_edge, t2,
-                                                    offset_time.valid ? offset_time.second_of_week
-                                                                      : kConstrainedFlowSecondOfDay);
+    Cost transition_cost =
+        costing_->TransitionCostReverse(directededge->localedgeidx(), nodeinfo, opp_edge,
+                                        opp_pred_edge, pred.has_measured_speed());
+    uint8_t flow_sources;
+    Cost newcost =
+        pred.cost() + costing_->EdgeCost(opp_edge, t2, offset_time.second_of_week, flow_sources);
     newcost.cost += transition_cost.cost;
+    uint32_t path_dist = pred.path_distance() + directededge->length();
 
     // Check if edge is temporarily labeled and this path has less cost. If
     // less cost the predecessor is updated and the sort cost is decremented
@@ -331,8 +373,8 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
       BDEdgeLabel& lab = bdedgelabels_[es->index()];
       if (newcost.cost < lab.cost().cost) {
         float newsortcost = lab.sortcost() - (lab.cost().cost - newcost.cost);
-        adjacencylist_->decrease(es->index(), newsortcost);
-        lab.Update(pred_idx, newcost, newsortcost, transition_cost, has_time_restrictions);
+        adjacencylist_.decrease(es->index(), newsortcost);
+        lab.Update(pred_idx, newcost, newsortcost, transition_cost, path_dist, restriction_idx);
       }
       continue;
     }
@@ -340,9 +382,12 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
     // Add edge label, add to the adjacency list and set edge status
     uint32_t idx = bdedgelabels_.size();
     *es = {EdgeSet::kTemporary, idx};
-    bdedgelabels_.emplace_back(pred_idx, edgeid, opp_edge_id, directededge, newcost, newcost.cost,
-                               0.0f, mode_, transition_cost, false, has_time_restrictions);
-    adjacencylist_->add(idx);
+    bdedgelabels_.emplace_back(pred_idx, edgeid, opp_edge_id, directededge, newcost, mode_,
+                               transition_cost, path_dist, false,
+                               (pred.closure_pruning() || !costing_->IsClosed(directededge, tile)),
+                               static_cast<bool>(flow_sources & kDefaultFlowMask), restriction_idx,
+                               pred.path_id());
+    adjacencylist_.add(idx);
   }
 
   // Handle transitions - expand from the end node of each transition
@@ -357,7 +402,7 @@ void Dijkstras::ExpandReverse(GraphReader& graphreader,
 // Compute the reverse graph traversal
 void Dijkstras::ComputeReverse(google::protobuf::RepeatedPtrField<valhalla::Location>& dest_locations,
                                GraphReader& graphreader,
-                               const std::shared_ptr<DynamicCost>* mode_costing,
+                               const sif::mode_costing_t& mode_costing,
                                const TravelMode mode) {
   // Set the mode and costing
   mode_ = mode;
@@ -365,7 +410,7 @@ void Dijkstras::ComputeReverse(google::protobuf::RepeatedPtrField<valhalla::Loca
   access_mode_ = costing_->access_mode();
 
   // Prepare for graph traversal
-  Initialize(bdedgelabels_, costing_->UnitSize());
+  Initialize(bdedgelabels_, adjacencylist_, costing_->UnitSize());
   SetDestinationLocations(graphreader, dest_locations, costing_);
 
   // Get the time information for all the destination locations
@@ -376,14 +421,14 @@ void Dijkstras::ComputeReverse(google::protobuf::RepeatedPtrField<valhalla::Loca
   while (cb_decision != ExpansionRecommendation::stop_expansion) {
     // Get next element from adjacency list. Check that it is valid. An
     // invalid label indicates there are no edges that can be expanded.
-    uint32_t predindex = adjacencylist_->pop();
+    uint32_t predindex = adjacencylist_.pop();
     if (predindex == kInvalidLabel) {
       break;
     }
 
     // Copy the EdgeLabel for use in costing and settle the edge.
     BDEdgeLabel pred = bdedgelabels_[predindex];
-    edgestatus_.Update(pred.edgeid(), EdgeSet::kPermanent);
+    edgestatus_.Update(pred.edgeid(), EdgeSet::kPermanent, pred.path_id());
 
     // Get the opposing predecessor directed edge. Need to make sure we get
     // the correct one if a transition occurred
@@ -391,7 +436,7 @@ void Dijkstras::ComputeReverse(google::protobuf::RepeatedPtrField<valhalla::Loca
         graphreader.GetGraphTile(pred.opp_edgeid())->directededge(pred.opp_edgeid());
 
     // Check if we should stop
-    cb_decision = ShouldExpand(graphreader, pred, InfoRoutingType::forward);
+    cb_decision = ShouldExpand(graphreader, pred, ExpansionType::reverse);
     if (cb_decision != ExpansionRecommendation::prune_expansion) {
       // Expand from the end node in forward direction.
       ExpandReverse(graphreader, pred.endnode(), pred, predindex, opp_pred_edge, false,
@@ -408,11 +453,11 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
                                         const bool from_transition,
                                         const std::shared_ptr<DynamicCost>& pc,
                                         const std::shared_ptr<DynamicCost>& tc,
-                                        const std::shared_ptr<DynamicCost>* mode_costing,
+                                        const sif::mode_costing_t& mode_costing,
                                         const TimeInfo& time_info) {
   // Get the tile and the node info. Skip if tile is null (can happen
   // with regional data sets) or if no access at the node.
-  const GraphTile* tile = graphreader.GetGraphTile(node);
+  auto tile = graphreader.GetGraphTile(node);
   if (tile == nullptr) {
     return;
   }
@@ -496,7 +541,7 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
 
   // Expand from end node.
   GraphId edgeid(node.tileid(), node.level(), nodeinfo->edge_index());
-  EdgeStatusInfo* es = edgestatus_.GetPtr(edgeid, tile);
+  EdgeStatusInfo* es = edgestatus_.GetPtr(edgeid, tile, pred.path_id());
   const DirectedEdge* directededge = tile->directededge(nodeinfo->edge_index());
   for (uint32_t i = 0; i < nodeinfo->edge_count(); i++, directededge++, ++edgeid, ++es) {
     // Skip shortcut edges and edges that are permanently labeled (best
@@ -513,10 +558,10 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
     // costing - assume if you get a transit edge you walked to the transit stop
     uint32_t tripid = 0;
     uint32_t blockid = 0;
-    bool has_time_restrictions = false;
+    uint8_t restriction_idx = -1;
     if (directededge->IsTransitLine()) {
       // Check if transit costing allows this edge
-      if (!tc->Allowed(directededge, pred, tile, edgeid, 0, 0, has_time_restrictions)) {
+      if (!tc->Allowed(directededge, pred, tile, edgeid, 0, 0, restriction_idx)) {
         continue;
       }
 
@@ -594,7 +639,7 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
       // is allowed. If mode is pedestrian this will validate walking
       // distance has not been exceeded.
       if (!mode_costing[static_cast<uint32_t>(mode_)]->Allowed(directededge, pred, tile, edgeid, 0, 0,
-                                                               has_time_restrictions)) {
+                                                               restriction_idx)) {
         continue;
       }
 
@@ -641,14 +686,15 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
     }
 
     // Make the label in advance, we may not end up using it but we need it for the expansion decision
-    MMEdgeLabel edge_label{pred_idx,    edgeid,           directededge,
-                           newcost,     newcost.cost,     0.0f,
-                           mode_,       walking_distance, tripid,
-                           prior_stop,  blockid,          operator_id,
-                           has_transit, transition_cost,  has_time_restrictions};
+    MMEdgeLabel edge_label{pred_idx,      edgeid,           directededge,
+                           newcost,       newcost.cost,     0.0f,
+                           mode_,         walking_distance, tripid,
+                           prior_stop,    blockid,          operator_id,
+                           has_transit,   transition_cost,  restriction_idx,
+                           pred.path_id()};
 
     // See if this is even worth expanding
-    auto maybe_expand = ShouldExpand(graphreader, edge_label, InfoRoutingType::multi_modal);
+    auto maybe_expand = ShouldExpand(graphreader, edge_label, ExpansionType::multimodal);
     if (maybe_expand == ExpansionRecommendation::prune_expansion ||
         maybe_expand == ExpansionRecommendation::stop_expansion) {
       continue;
@@ -662,9 +708,9 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
       MMEdgeLabel& lab = mmedgelabels_[es->index()];
       if (newcost.cost < lab.cost().cost) {
         float newsortcost = lab.sortcost() - (lab.cost().cost - newcost.cost);
-        adjacencylist_->decrease(es->index(), newsortcost);
+        mmadjacencylist_.decrease(es->index(), newsortcost);
         lab.Update(pred_idx, newcost, newsortcost, walking_distance, tripid, blockid, transition_cost,
-                   has_time_restrictions);
+                   restriction_idx);
       }
       continue;
     }
@@ -673,7 +719,7 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
     uint32_t idx = mmedgelabels_.size();
     *es = {EdgeSet::kTemporary, idx};
     mmedgelabels_.emplace_back(edge_label);
-    adjacencylist_->add(idx);
+    mmadjacencylist_.add(idx);
   }
 
   // Handle transitions - expand from the end node of each transition
@@ -690,7 +736,7 @@ void Dijkstras::ExpandForwardMultiModal(GraphReader& graphreader,
 void Dijkstras::ComputeMultiModal(
     google::protobuf::RepeatedPtrField<valhalla::Location>& origin_locations,
     GraphReader& graphreader,
-    const std::shared_ptr<DynamicCost>* mode_costing,
+    const sif::mode_costing_t& mode_costing,
     const TravelMode mode) {
   // For pedestrian costing - set flag allowing use of transit connections
   // Set pedestrian costing to use max distance. TODO - need for other modes
@@ -716,7 +762,7 @@ void Dijkstras::ComputeMultiModal(
   auto time_infos = SetTime(origin_locations, graphreader);
 
   // Prepare for graph traversal
-  Initialize(mmedgelabels_, mode_costing[static_cast<uint8_t>(mode_)]->UnitSize());
+  Initialize(mmedgelabels_, mmadjacencylist_, mode_costing[static_cast<uint8_t>(mode_)]->UnitSize());
   SetOriginLocationsMultiModal(graphreader, origin_locations,
                                mode_costing[static_cast<uint8_t>(mode_)]);
 
@@ -731,22 +777,21 @@ void Dijkstras::ComputeMultiModal(
   processed_tiles_.clear();
 
   // Expand using adjacency list until we exceed threshold
-  const GraphTile* tile;
   auto cb_decision = ExpansionRecommendation::continue_expansion;
   while (cb_decision != ExpansionRecommendation::stop_expansion) {
     // Get next element from adjacency list. Check that it is valid. An
     // invalid label indicates there are no edges that can be expanded.
-    uint32_t predindex = adjacencylist_->pop();
+    const uint32_t predindex = adjacencylist_.pop();
     if (predindex == kInvalidLabel) {
       break;
     }
 
     // Copy the EdgeLabel for use in costing and settle the edge.
     MMEdgeLabel pred = mmedgelabels_[predindex];
-    edgestatus_.Update(pred.edgeid(), EdgeSet::kPermanent);
+    edgestatus_.Update(pred.edgeid(), EdgeSet::kPermanent, pred.path_id());
 
     // Check if we should stop
-    cb_decision = ShouldExpand(graphreader, pred, InfoRoutingType::multi_modal);
+    cb_decision = ShouldExpand(graphreader, pred, ExpansionType::multimodal);
     if (cb_decision != ExpansionRecommendation::prune_expansion) {
       // Expand from the end node of the predecessor edge.
       ExpandForwardMultiModal(graphreader, pred.endnode(), pred, predindex, false, pc, tc,
@@ -759,8 +804,14 @@ void Dijkstras::ComputeMultiModal(
 void Dijkstras::SetOriginLocations(GraphReader& graphreader,
                                    google::protobuf::RepeatedPtrField<valhalla::Location>& locations,
                                    const std::shared_ptr<DynamicCost>& costing) {
+  // Bail if you want to do a multipath expansion with more locations than edge label/status supports
+  if (multipath_ && locations.size() > baldr::kMaxMultiPathId)
+    throw std::runtime_error("Max number of locations exceeded");
+
   // Add edges for each location to the adjacency list
+  uint8_t path_id = -1;
   for (auto& location : locations) {
+    ++path_id;
 
     // Only skip inbound edges if we have other options
     bool has_other_edges = false;
@@ -783,11 +834,11 @@ void Dijkstras::SetOriginLocations(GraphReader& graphreader,
       }
 
       // Get the directed edge
-      const GraphTile* tile = graphreader.GetGraphTile(edgeid);
+      graph_tile_ptr tile = graphreader.GetGraphTile(edgeid);
       const DirectedEdge* directededge = tile->directededge(edgeid);
 
       // Get the opposing directed edge, continue if we cannot get it
-      const GraphTile* opp_tile = nullptr;
+      graph_tile_ptr opp_tile = nullptr;
       GraphId opp_edge_id = graphreader.GetOpposingEdgeId(edgeid, opp_tile);
       if (!opp_edge_id.Is_Valid()) {
         continue;
@@ -795,7 +846,11 @@ void Dijkstras::SetOriginLocations(GraphReader& graphreader,
       const DirectedEdge* opp_dir_edge = opp_tile->directededge(opp_edge_id);
 
       // Get cost
-      Cost cost = costing->EdgeCost(directededge, tile) * (1.0f - edge.percent_along());
+      uint8_t flow_sources;
+      Cost cost = costing->EdgeCost(directededge, tile, kConstrainedFlowSecondOfDay, flow_sources) *
+                  (1.0f - edge.percent_along());
+      // Get path distance
+      auto path_dist = directededge->length() * (1 - edge.percent_along());
 
       // We need to penalize this location based on its score (distance in meters from input)
       // We assume the slowest speed you could travel to cover that distance to start/end the route
@@ -806,15 +861,17 @@ void Dijkstras::SetOriginLocations(GraphReader& graphreader,
       // Construct the edge label. Set the predecessor edge index to invalid
       // to indicate the origin of the path.
       uint32_t idx = bdedgelabels_.size();
-      const bool has_time_restrictions = false;
-      bdedgelabels_.emplace_back(kInvalidLabel, edgeid, opp_edge_id, directededge, cost, cost.cost,
-                                 0., mode_, Cost{}, false, has_time_restrictions);
+      int restriction_idx = -1;
+      bdedgelabels_.emplace_back(kInvalidLabel, edgeid, opp_edge_id, directededge, cost, mode_,
+                                 Cost{}, path_dist, false, !(costing_->IsClosed(directededge, tile)),
+                                 static_cast<bool>(flow_sources & kDefaultFlowMask), restriction_idx,
+                                 multipath_ ? path_id : 0);
       // Set the origin flag
       bdedgelabels_.back().set_origin();
 
       // Add EdgeLabel to the adjacency list
-      adjacencylist_->add(idx);
-      edgestatus_.Set(edgeid, EdgeSet::kTemporary, idx, tile);
+      adjacencylist_.add(idx);
+      edgestatus_.Set(edgeid, EdgeSet::kTemporary, idx, tile, multipath_ ? path_id : 0);
     }
   }
 }
@@ -824,8 +881,15 @@ void Dijkstras::SetDestinationLocations(
     GraphReader& graphreader,
     google::protobuf::RepeatedPtrField<valhalla::Location>& locations,
     const std::shared_ptr<DynamicCost>& costing) {
+  // Bail if you want to do a multipath expansion with more locations than edge label/status supports
+  if (multipath_ && locations.size() > baldr::kMaxMultiPathId)
+    throw std::runtime_error("Max number of locations exceeded");
+
   // Add edges for each location to the adjacency list
+  uint8_t path_id = -1;
   for (auto& location : locations) {
+    ++path_id;
+
     // Only skip outbound edges if we have other options
     bool has_other_edges = false;
     std::for_each(location.path_edges().begin(), location.path_edges().end(),
@@ -848,11 +912,11 @@ void Dijkstras::SetDestinationLocations(
       }
 
       // Get the directed edge
-      const GraphTile* tile = graphreader.GetGraphTile(edgeid);
+      graph_tile_ptr tile = graphreader.GetGraphTile(edgeid);
       const DirectedEdge* directededge = tile->directededge(edgeid);
 
       // Get the opposing directed edge, continue if we cannot get it
-      const GraphTile* opp_tile = nullptr;
+      graph_tile_ptr opp_tile = nullptr;
       GraphId opp_edge_id = graphreader.GetOpposingEdgeId(edgeid, opp_tile);
       if (!opp_edge_id.Is_Valid()) {
         continue;
@@ -860,7 +924,11 @@ void Dijkstras::SetDestinationLocations(
       const DirectedEdge* opp_dir_edge = opp_tile->directededge(opp_edge_id);
 
       // Get the cost
-      Cost cost = costing->EdgeCost(directededge, tile) * edge.percent_along();
+      uint8_t flow_sources;
+      Cost cost = costing->EdgeCost(directededge, tile, kConstrainedFlowSecondOfDay, flow_sources) *
+                  edge.percent_along();
+      // Get the path distance
+      auto path_dist = directededge->length() * edge.percent_along();
 
       // We need to penalize this location based on its score (distance in meters from input)
       // We assume the slowest speed you could travel to cover that distance to start/end the route
@@ -872,11 +940,21 @@ void Dijkstras::SetDestinationLocations(
       // to invalid to indicate the origin of the path. Make sure the opposing
       // edge (edgeid) is set.
       uint32_t idx = bdedgelabels_.size();
-      const bool has_time_restrictions = false;
-      bdedgelabels_.emplace_back(kInvalidLabel, opp_edge_id, edgeid, opp_dir_edge, cost, cost.cost,
-                                 0., mode_, Cost{}, false, has_time_restrictions);
-      adjacencylist_->add(idx);
-      edgestatus_.Set(opp_edge_id, EdgeSet::kTemporary, idx, graphreader.GetGraphTile(opp_edge_id));
+      int restriction_idx = -1;
+      // TODO: When running expansion in reverse, handle the case where the
+      // destination lies on a closure but the expansion started from an open
+      // edge. Currently, we begin with closure prunning turned on and hence
+      // don't expand into closures. This results in pessimistic reach. What
+      // we want is for the expansion to continue when it encounters the first
+      // closure and stop when it exits the closure (which can span multiple
+      // consecutive edges)
+      bdedgelabels_.emplace_back(kInvalidLabel, opp_edge_id, edgeid, opp_dir_edge, cost, mode_,
+                                 Cost{}, path_dist, false, !(costing_->IsClosed(directededge, tile)),
+                                 static_cast<bool>(flow_sources & kDefaultFlowMask), restriction_idx,
+                                 multipath_ ? path_id : 0);
+      adjacencylist_.add(idx);
+      edgestatus_.Set(opp_edge_id, EdgeSet::kTemporary, idx, graphreader.GetGraphTile(opp_edge_id),
+                      multipath_ ? path_id : 0);
     }
   }
 }
@@ -909,12 +987,12 @@ void Dijkstras::SetOriginLocationsMultiModal(
       }
 
       // Get the directed edge
-      const GraphTile* tile = graphreader.GetGraphTile(edgeid);
+      graph_tile_ptr tile = graphreader.GetGraphTile(edgeid);
       const DirectedEdge* directededge = tile->directededge(edgeid);
 
       // Get the tile at the end node. Skip if tile not found as we won't be
       // able to expand from this origin edge.
-      const GraphTile* endtile = graphreader.GetGraphTile(directededge->endnode());
+      graph_tile_ptr endtile = graphreader.GetGraphTile(directededge->endnode());
       if (endtile == nullptr) {
         continue;
       }
@@ -934,18 +1012,18 @@ void Dijkstras::SetOriginLocationsMultiModal(
       uint32_t idx = mmedgelabels_.size();
       uint32_t d = static_cast<uint32_t>(directededge->length() * (1.0f - edge.percent_along()));
       // TODO Do we care about time restrictions at origin edges?
-      bool has_time_restrictions = false;
+      int restriction_idx = -1;
       // TODO How about transition cost?
       auto transition_cost = Cost{};
       MMEdgeLabel edge_label(kInvalidLabel, edgeid, directededge, cost, cost.cost, 0.0f, mode_, d, 0,
-                             GraphId(), 0, 0, false, transition_cost, has_time_restrictions);
+                             GraphId(), 0, 0, false, transition_cost, restriction_idx);
 
       // Set the origin flag
       edge_label.set_origin();
 
       // Add EdgeLabel to the adjacency list
       mmedgelabels_.push_back(edge_label);
-      adjacencylist_->add(idx);
+      mmadjacencylist_.add(idx);
     }
   }
 }

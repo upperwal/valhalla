@@ -10,7 +10,14 @@ set(sources
   pedestriancost.cc
   transitcost.cc
   truckcost.cc
-  dynamiccost.cc)
+  dynamiccost.cc
+  recost.cc)
+
+if (UNIX)
+  # Enables stricter compiler checks on a file-by-file basis
+  # which allows us to migrate piecemeal
+  set_source_files_properties(${sources} PROPERTIES COMPILE_FLAGS "-Werror")
+endif (UNIX)
 
 valhalla_module(NAME sif
   SOURCES ${sources}
@@ -20,7 +27,7 @@ valhalla_module(NAME sif
       ${VALHALLA_SOURCE_DIR}
       ${VALHALLA_SOURCE_DIR}/valhalla
       ${VALHALLA_SOURCE_DIR}/third_party/date/include
-      $<$<BOOL:${MSVC}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
+      $<$<BOOL:${WIN32}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
     PRIVATE
       ${VALHALLA_SOURCE_DIR}/third_party/rapidjson/include
   DEPENDS

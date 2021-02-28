@@ -1,7 +1,3 @@
-#include <boost/archive/iterators/base64_from_binary.hpp>
-#include <boost/archive/iterators/binary_from_base64.hpp>
-#include <boost/archive/iterators/transform_width.hpp>
-
 #include <iostream>
 
 #include "baldr/predictedspeeds.h"
@@ -15,22 +11,19 @@ using namespace valhalla::midgard;
 
 namespace {
 
-// base64 decoding
-std::string decode64(const std::string& val) {
-  using namespace boost::archive::iterators;
-  using It = transform_width<binary_from_base64<std::string::const_iterator>, 8, 6>;
-  return std::string(It(std::begin(val)), It(std::end(val)));
-}
-
-// Convert big endian bytes to little endian
-int16_t to_little_endian(const int16_t val) {
-  return (val << 8) | ((val >> 8) & 0x00ff);
-}
-
 // Check if the speed is within threshold for the test
 constexpr uint32_t kSpeedErrorThreshold = 2;
 inline bool within_threshold(const uint32_t v1, const uint32_t v2) {
   return (v2 > v1) ? (v2 - v1) < kSpeedErrorThreshold : (v1 - v2) < kSpeedErrorThreshold;
+}
+
+// normalized l1 norm of the vector
+float normalized_l1_norm(const float* vec, uint32_t size) {
+  assert(size > 0);
+  float sum = 0.f;
+  for (uint32_t i = 0; i < size; ++i)
+    sum += fabs(vec[i]);
+  return sum / size;
 }
 
 void try_free_flow_speed(const std::string& encoded_str,
@@ -63,7 +56,12 @@ TEST(PredicteSpeeds, test_decoding) {
 
   // Decode the base64 string and cast the data to a raw string of signed bytes
   auto decoded_str = decode64(encoded_speed_string);
-  EXPECT_EQ(decoded_str.size(), 402);
+  // HACK(mookerji): kDecodedSpeedSize+1 is the expected size (as opposed to kDecodedSpeedSize)
+  // because we start reading from a 1-byte offset below at the little endian conversion. This is
+  // actually a broken test fixture because we start reading from 0 in the actual CLI decoding in
+  // src/mjolnir/valhalla_add_predicted_traffic.cc. To FIX this, we need to encode the speeds[]
+  // array below and start the little endian conversion from 0 instead of 1.
+  EXPECT_EQ(decoded_str.size(), kDecodedSpeedSize + 1);
 
   auto raw = reinterpret_cast<const int8_t*>(decoded_str.data());
 
@@ -73,8 +71,8 @@ TEST(PredicteSpeeds, test_decoding) {
   // Create the coefficients. Each group of 2 bytes represents a signed, int16 number (big endian).
   // Convert to little endian.
   int idx = 1;
-  int16_t coefficients[200];
-  for (uint32_t i = 0; i < 200; ++i, idx += 2) {
+  int16_t coefficients[kCoefficientCount];
+  for (uint32_t i = 0; i < kCoefficientCount; ++i, idx += 2) {
     coefficients[i] = to_little_endian(*(reinterpret_cast<const int16_t*>(&raw[idx])));
   }
 
@@ -187,8 +185,8 @@ TEST(PredicteSpeeds, test_decoding) {
 
 /**
  * Test to check for negative speeds in an encoded predicted speed string. If we find cases
- * where we see a negative speed we should trace it back to a particular entry in the
- * csv input file and change the encoded speed string here to see if the issue is valid.
+ * where we see a negative speed we should trace it back to the input speeds and change the
+ * encoded speed string here to see if the issue is valid.
  */
 TEST(PredicteSpeeds, test_negative_speeds) {
   // base64 encoded string
@@ -197,7 +195,8 @@ TEST(PredicteSpeeds, test_negative_speeds) {
 
   // Decode the base64 string and cast the data to a raw string of signed bytes
   auto decoded_str = decode64(encoded_speed_string);
-  EXPECT_EQ(decoded_str.size(), 402);
+  // HACK(mookerji): See note above.
+  EXPECT_EQ(decoded_str.size(), kDecodedSpeedSize + 1);
 
   auto raw = reinterpret_cast<const int8_t*>(decoded_str.data());
 
@@ -207,8 +206,8 @@ TEST(PredicteSpeeds, test_negative_speeds) {
   // Create the coefficients. Each group of 2 bytes represents a signed, int16 number (big endian).
   // Convert to little endian.
   int idx = 1;
-  int16_t coefficients[200];
-  for (uint32_t i = 0; i < 200; ++i, idx += 2) {
+  int16_t coefficients[kCoefficientCount];
+  for (uint32_t i = 0; i < kCoefficientCount; ++i, idx += 2) {
     coefficients[i] = to_little_endian(*(reinterpret_cast<const int16_t*>(&raw[idx])));
   }
 
@@ -226,6 +225,62 @@ TEST(PredicteSpeeds, test_negative_speeds) {
     float s = pred_speeds.speed(0, secs);
     ASSERT_GE(s, 0.0f) << "Negative speed";
   }
+}
+
+TEST(PredictedSpeeds, test_compress_decompress_accuracy) {
+  // generate speed values for buckets
+  std::array<float, kBucketsPerWeek> speeds;
+  for (uint32_t i = 0; i < kBucketsPerWeek; ++i)
+    speeds[i] = roundf(30.f + 15.f * sin(i / 20.f));
+
+  // compress speed buckets
+  auto compressed_speeds = compress_speed_buckets(speeds.data());
+
+  // decompress speed buckets
+  std::array<float, kBucketsPerWeek> decompressed_speeds;
+  for (uint32_t i = 0; i < kBucketsPerWeek; ++i)
+    decompressed_speeds[i] = decompress_speed_bucket(compressed_speeds.data(), i);
+
+  std::array<float, kBucketsPerWeek> diff_speeds;
+  for (uint32_t i = 0; i < kBucketsPerWeek; ++i)
+    diff_speeds[i] = fabs(speeds[i] - decompressed_speeds[i]);
+
+  // check that average error of decompressing no more than threshold
+  float l1_err = normalized_l1_norm(diff_speeds.data(), diff_speeds.size());
+  EXPECT_LE(l1_err, 1.f) << "Low decompression accuracy"; // <= 1 KPH
+
+  // check that all decompressed speed values differ from original by no more than threshold
+  float max_diff = *std::max_element(diff_speeds.begin(), diff_speeds.end());
+  EXPECT_LE(max_diff, 2.f) << "Low decompression accuracy"; // <= 2 KPH
+}
+
+struct EncoderDecoderTest : public ::testing::Test {
+  EncoderDecoderTest() {
+    // fill in coefficients
+    for (size_t i = 0; i < coefficients.size(); ++i)
+      coefficients[i] = (i % 2 == 0) ? (10 * i) : (-10 * i);
+    // set corresponding encoded string
+    encoded =
+        "AAD/9gAU/+IAKP/OADz/ugBQ/6YAZP+SAHj/fgCM/2oAoP9WALT/QgDI/y4A3P8aAPD/BgEE/vIBGP7eASz+ygFA/rYBVP6iAWj+jgF8/noBkP5mAaT+UgG4/j4BzP4qAeD+FgH0/gICCP3uAhz92gIw/cYCRP2yAlj9ngJs/YoCgP12ApT9YgKo/U4CvP06AtD9JgLk/RIC+Pz+Awz86gMg/NYDNPzCA0j8rgNc/JoDcPyGA4T8cgOY/F4DrPxKA8D8NgPU/CID6PwOA/z7+gQQ++YEJPvSBDj7vgRM+6oEYPuWBHT7ggSI+24EnPtaBLD7RgTE+zIE2PseBOz7CgUA+vYFFPriBSj6zgU8+roFUPqmBWT6kgV4+n4FjPpqBaD6VgW0+kIFyPouBdz6GgXw+gYGBPnyBhj53gYs+coGQPm2BlT5ogZo+Y4GfPl6BpD5Zgak+VIGuPk+Bsz5Kgbg+RYG9PkCBwj47gcc+NoHMPjGB0T4sgdY+J4HbPiKB4D4dgeU+GIHqPhOB7z4Og==";
+  }
+
+  std::array<int16_t, kCoefficientCount> coefficients;
+  std::string encoded;
+};
+
+TEST_F(EncoderDecoderTest, test_speeds_encoder) {
+  // encode coefficients: base64-string for array values in big endian format
+  auto my_encoded = encode_compressed_speeds(coefficients.data());
+  // check encoded string
+  ASSERT_EQ(encoded, my_encoded) << "Incorrect encoded string";
+}
+
+TEST_F(EncoderDecoderTest, test_speeds_decoder) {
+  // decode coefficients
+  auto my_coefficients = decode_compressed_speeds(encoded);
+  // check decoded values
+  ASSERT_TRUE(std::equal(coefficients.begin(), coefficients.end(), my_coefficients.begin()))
+      << "Incorrect decoded coefficients";
 }
 
 } // namespace

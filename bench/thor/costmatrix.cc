@@ -16,12 +16,6 @@ using namespace valhalla;
 
 namespace {
 
-void create_costing_options(Options& options) {
-  const rapidjson::Document doc;
-  sif::ParseAutoCostOptions(doc, "/costing_options/auto", options.add_costing_options());
-  options.add_costing_options();
-}
-
 boost::property_tree::ptree json_to_pt(const std::string& json) {
   std::stringstream ss;
   ss << json;
@@ -53,7 +47,7 @@ const auto config = json_to_pt(R"({
       "bus": {"max_distance": 5000000.0,"max_locations": 50,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
       "hov": {"max_distance": 5000000.0,"max_locations": 20,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
       "taxi": {"max_distance": 5000000.0,"max_locations": 20,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
-      "isochrone": {"max_contours": 4,"max_distance": 25000.0,"max_locations": 1,"max_time": 120},
+      "isochrone": {"max_contours": 4,"max_distance": 25000.0,"max_locations": 1,"max_time_contour": 120,"max_distance_contour":200},
       "max_avoid_locations": 50,"max_radius": 200,"max_reachability": 100,"max_alternates":2,
       "multimodal": {"max_distance": 500000.0,"max_locations": 50,"max_matrix_distance": 0.0,"max_matrix_locations": 0},
       "pedestrian": {"max_distance": 250000.0,"max_locations": 50,"max_matrix_distance": 200000.0,"max_matrix_locations": 50,"max_transit_walking_distance": 10000,"min_transit_walking_distance": 1},
@@ -64,12 +58,11 @@ const auto config = json_to_pt(R"({
     }
   })");
 
-baldr::GraphReader reader(config.get_child("mjolnir"));
-
 constexpr float kMaxRange = 256;
 
 static void BM_UtrechtCostMatrix(benchmark::State& state) {
   const int size = state.range(0);
+  baldr::GraphReader reader(config.get_child("mjolnir"));
 
   // Generate N random locations within the Utrect bounding box;
   std::vector<valhalla::baldr::Location> locations;
@@ -88,10 +81,17 @@ static void BM_UtrechtCostMatrix(benchmark::State& state) {
   }
 
   Options options;
-  create_costing_options(options);
-  auto costs = sif::CreateAutoCost(Costing::auto_, options);
+  options.set_costing(Costing::auto_);
+  rapidjson::Document doc;
+  sif::ParseCostingOptions(doc, "/costing_options", options);
+  sif::TravelMode mode;
+  auto costs = sif::CostFactory().CreateModeCosting(options, mode);
+  auto cost = costs[static_cast<size_t>(mode)];
 
-  const auto projections = loki::Search(locations, reader, costs);
+  const auto projections = loki::Search(locations, reader, cost);
+  if (projections.size() == 0) {
+    throw std::runtime_error("Found no matching locations");
+  }
 
   google::protobuf::RepeatedPtrField<valhalla::Location> sources;
 
@@ -104,9 +104,9 @@ static void BM_UtrechtCostMatrix(benchmark::State& state) {
 
   for (auto _ : state) {
     thor::CostMatrix matrix;
-    auto result =
-        matrix.SourceToTarget(sources, sources, reader, &costs, sif::TravelMode::kDrive, 100000.);
-    result_size = result.size();
+    auto result = matrix.SourceToTarget(sources, sources, reader, costs, mode, 100000.);
+    matrix.Clear();
+    result_size += result.size();
   }
   state.counters["Routes"] = benchmark::Counter(size, benchmark::Counter::kIsIterationInvariantRate);
 }

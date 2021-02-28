@@ -1,9 +1,11 @@
 file(GLOB headers ${VALHALLA_SOURCE_DIR}/valhalla/thor/*.h)
 
 set(sources
-  astar.cc
+  alternates.cc
+  astar_bss.cc
   attributes_controller.cc
   bidirectional_astar.cc
+  centroid.cc
   costmatrix.cc
   dijkstras.cc
   isochrone_action.cc
@@ -18,10 +20,23 @@ set(sources
   timedep_forward.cc
   timedep_reverse.cc
   timedistancematrix.cc
+  timedistancebssmatrix.cc
   trace_attributes_action.cc
   trace_route_action.cc
   triplegbuilder.cc
+  triplegbuilder_utils.h
   worker.cc)
+
+if (UNIX AND NOT APPLE)
+  # Enables stricter compiler checks on a file-by-file basis
+  # which allows us to migrate piecemeal
+  set_source_files_properties(
+    alternates.cc
+    attributes_controller.cc
+    triplegbuilder.cc
+    worker.cc
+  PROPERTIES COMPILE_FLAGS "-Wall -Werror")
+endif ()
 
 valhalla_module(NAME thor
   SOURCES ${sources}
@@ -31,7 +46,7 @@ valhalla_module(NAME thor
       ${VALHALLA_SOURCE_DIR}
       ${VALHALLA_SOURCE_DIR}/valhalla
       ${VALHALLA_SOURCE_DIR}/third_party/date/include
-      $<$<BOOL:${MSVC}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
+      $<$<BOOL:${WIN32}>:${VALHALLA_SOURCE_DIR}/third_party/dirent/include>
     PRIVATE
       ${VALHALLA_SOURCE_DIR}/third_party/rapidjson/include
       ${CMAKE_BINARY_DIR}

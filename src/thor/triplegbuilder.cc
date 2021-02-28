@@ -12,16 +12,18 @@
 #include "baldr/graphconstants.h"
 #include "baldr/signinfo.h"
 #include "baldr/tilehierarchy.h"
+#include "baldr/time_info.h"
 #include "meili/match_result.h"
 #include "midgard/encoded.h"
 #include "midgard/logging.h"
 #include "midgard/pointll.h"
 #include "midgard/util.h"
+#include "proto/tripcommon.pb.h"
 #include "sif/costconstants.h"
+#include "sif/recost.h"
 #include "thor/attributes_controller.h"
 #include "thor/triplegbuilder.h"
-
-#include <valhalla/proto/tripcommon.pb.h>
+#include "triplegbuilder_utils.h"
 
 using namespace valhalla;
 using namespace valhalla::baldr;
@@ -63,6 +65,7 @@ void AssignAdmins(const AttributesController& controller,
                   const std::vector<AdminInfo>& admin_info_list) {
   if (controller.category_attribute_enabled(kAdminCategory)) {
     // Assign the admins
+    trip_path.mutable_admin()->Reserve(admin_info_list.size());
     for (const auto& admin_info : admin_info_list) {
       TripLeg_Admin* trip_admin = trip_path.add_admin();
 
@@ -89,47 +92,275 @@ void AssignAdmins(const AttributesController& controller,
   }
 }
 
+/**
+ * Used to add or update incidents attached to the provided leg. We could do something more exotic to
+ * avoid linear scan, like keeping a separate lookup outside of the pbf
+ * @param leg        the leg to update
+ * @param incident   the incident that applies
+ * @param index      what shape index of the leg the index apples to
+ */
+void UpdateIncident(const std::shared_ptr<const valhalla::IncidentsTile>& incidents_tile,
+                    TripLeg& leg,
+                    const valhalla::IncidentsTile::Location* incident_location,
+                    uint32_t index) {
+  const uint64_t current_incident_id =
+      valhalla::baldr::getIncidentMetadata(incidents_tile, *incident_location).id();
+  auto found = std::find_if(leg.mutable_incidents()->begin(), leg.mutable_incidents()->end(),
+                            [current_incident_id](const TripLeg::Incident& candidate) {
+                              return current_incident_id == candidate.metadata().id();
+                            });
+  // Are we continuing an incident (this could be a hash look up)
+  if (found != leg.mutable_incidents()->end()) {
+    found->set_end_shape_index(index);
+  } // We are starting a new incident
+  else {
+    auto* new_incident = leg.mutable_incidents()->Add();
+
+    // Get the full incident metadata from the incident-tile
+    const auto& meta = valhalla::baldr::getIncidentMetadata(incidents_tile, *incident_location);
+    *new_incident->mutable_metadata() = meta;
+
+    new_incident->set_begin_shape_index(index);
+    new_incident->set_end_shape_index(index);
+  }
+}
+
+valhalla::TripLeg_Closure* fetch_last_closure_annotation(TripLeg& leg) {
+  return leg.closures_size() ? leg.mutable_closures(leg.closures_size() - 1) : nullptr;
+}
+
+valhalla::TripLeg_Closure* fetch_or_create_closure_annotation(TripLeg& leg) {
+  valhalla::TripLeg_Closure* closure = fetch_last_closure_annotation(leg);
+  // If last closure annotation has its end index populated, create a new
+  // closure annotation
+  return (!closure || closure->has_end_shape_index()) ? leg.add_closures() : closure;
+}
+
+/**
+ * Chops up the shape for an edge so that we have shape points where speeds change along the edge
+ * and where incidents occur along the edge. Also sets the various per shape point attributes
+ * such as time, distance, speed. Also updates the incidents list on the edge with their shape indices
+ * @param controller
+ * @param tile
+ * @param edge
+ * @param shape
+ * @param shape_begin
+ * @param leg
+ * @param src_pct
+ * @param tgt_pct
+ * @param edge_seconds
+ * @param cut_for_traffic
+ * @param incidents
+ */
 void SetShapeAttributes(const AttributesController& controller,
-                        const GraphTile* tile,
+                        const graph_tile_ptr& tile,
                         const DirectedEdge* edge,
-                        const std::shared_ptr<sif::DynamicCost>& costing,
-                        std::vector<PointLL>::const_iterator shape_begin,
-                        std::vector<PointLL>::const_iterator shape_end,
-                        TripLeg& trip_path,
-                        uint32_t second_of_week,
-                        double edge_percentage) {
-  if (trip_path.has_shape_attributes()) {
-    // calculates total edge time and total edge length
-    // TODO: you can get this directly from the path edge by taking its cost and subtracting off
-    // the transition cost that it also now contains
-    double edge_time =
-        costing->EdgeCost(edge, tile, second_of_week).secs * edge_percentage; // seconds
-    // TODO: get the measured length from shape (full shape) to increase precision
-    double edge_length = edge->length() * edge_percentage; // meters
-    // Set the shape attributes
-    for (++shape_begin; shape_begin < shape_end; ++shape_begin) {
-      double distance = shape_begin->Distance(*(shape_begin - 1)); // meters
-      double distance_pct = distance / edge_length;                // fraction of edge length
-      double time = edge_time * distance_pct;                      // seconds
+                        std::vector<PointLL>& shape,
+                        size_t shape_begin,
+                        TripLeg& leg,
+                        double src_pct,
+                        double tgt_pct,
+                        double edge_seconds,
+                        bool cut_for_traffic,
+                        const valhalla::baldr::IncidentResult& incidents) {
+  // TODO: if this is a transit edge then the costing will throw
 
-      // Set shape attributes time per shape point if requested
-      if (controller.attributes.at(kShapeAttributesTime)) {
-        // convert time to milliseconds and then round to an integer
-        trip_path.mutable_shape_attributes()->add_time((time * kMillisecondPerSec) + 0.5);
-      }
+  // bail if nothing to do
+  if (!cut_for_traffic && incidents.start_index == incidents.end_index &&
+      !controller.category_attribute_enabled(kShapeAttributesCategory)) {
+    return;
+  }
 
-      // Set shape attributes length per shape point if requested
-      if (controller.attributes.at(kShapeAttributesLength)) {
-        // convert length to decimeters and then round to an integer
-        trip_path.mutable_shape_attributes()->add_length((distance * kDecimeterPerMeter) + 0.5);
-      }
+  // initialize shape_attributes once
+  if (!leg.has_shape_attributes() &&
+      controller.category_attribute_enabled(kShapeAttributesCategory)) {
+    leg.mutable_shape_attributes();
+  }
 
-      // Set shape attributes speed per shape point if requested
-      if (controller.attributes.at(kShapeAttributesSpeed)) {
-        // convert speed to decimeters per sec and then round to an integer
-        trip_path.mutable_shape_attributes()->add_speed((distance * kDecimeterPerMeter / time) + 0.5);
+  // convenient for bundling info about the spots where we cut the shape
+  struct cut_t {
+    double percent_along;
+    double speed; // meters per second
+    uint8_t congestion;
+    std::vector<const valhalla::IncidentsTile::Location*> incidents;
+    bool closed;
+  };
+
+  // A list of percent along the edge, corresponding speed (meters per second), incident id
+  std::vector<cut_t> cuts;
+  double speed = (edge->length() * (tgt_pct - src_pct)) / edge_seconds;
+  if (cut_for_traffic) {
+    // TODO: we'd like to use the speed from traffic here but because there are synchronization
+    // problems with those records changing between when we used them to make the path and when we
+    // try to grab them again here, we instead rely on the total time from PathInfo and just do the
+    // cutting for now
+    const auto& traffic_speed = tile->trafficspeed(edge);
+    if (traffic_speed.breakpoint1 > 0) {
+      cuts.emplace_back(cut_t{traffic_speed.breakpoint1 / 255.0,
+                              speed,
+                              static_cast<std::uint8_t>(traffic_speed.congestion1),
+                              {},
+                              traffic_speed.closed(0)});
+      if (traffic_speed.breakpoint2 > 0) {
+        cuts.emplace_back(cut_t{traffic_speed.breakpoint2 / 255.0,
+                                speed,
+                                static_cast<std::uint8_t>(traffic_speed.congestion2),
+                                {},
+                                traffic_speed.closed(1)});
+        if (traffic_speed.speed3 != UNKNOWN_TRAFFIC_SPEED_RAW) {
+          cuts.emplace_back(cut_t{1,
+                                  speed,
+                                  static_cast<std::uint8_t>(traffic_speed.congestion3),
+                                  {},
+                                  traffic_speed.closed(2)});
+        }
       }
     }
+  }
+
+  // Cap the end so that we always have something to use
+  if (cuts.empty() || cuts.back().percent_along < tgt_pct) {
+    cuts.emplace_back(cut_t{tgt_pct, speed, UNKNOWN_CONGESTION_VAL, {}, false});
+  }
+
+  // sort the start and ends of the incidents along this edge
+  for (auto incident_location_index = incidents.start_index;
+       incident_location_index != incidents.end_index; ++incident_location_index) {
+    if (incident_location_index >= incidents.tile->locations_size()) {
+      throw std::logic_error(
+          "invalid incident_location_index: " + std::to_string(incident_location_index) + " vs " +
+          std::to_string(incidents.tile->locations_size()));
+    }
+    const auto& incident = incidents.tile->locations(incident_location_index);
+    // if the incident is actually on the part of the edge we are using
+    if (incident.start_offset() > tgt_pct || incident.end_offset() < src_pct)
+      continue;
+    // insert the start point and end points
+    for (auto offset : {
+             std::max((double)incident.start_offset(), src_pct),
+             std::min((double)incident.end_offset(), tgt_pct),
+         }) {
+      // if this is clipped at the beginning of the edge then its not a new cut but we still need to
+      // attach the incidents information to the leg
+      if (offset == src_pct) {
+        UpdateIncident(incidents.tile, leg, &incident, shape_begin);
+        continue;
+      }
+
+      // where does it go in the sorted list
+      auto itr = std::partition_point(cuts.begin(), cuts.end(),
+                                      [offset](const cut_t& c) { return c.percent_along < offset; });
+      // there is already a cut here so we just add the incident
+      if (itr != cuts.end() && itr->percent_along == offset) {
+        itr->incidents.push_back(&incident);
+      } // there wasnt a cut here so we need to make one
+      else {
+        cuts.insert(itr, cut_t{offset,
+                               itr == cuts.end() ? speed : itr->speed,
+                               itr == cuts.end() ? UNKNOWN_CONGESTION_VAL : itr->congestion,
+                               {&incident},
+                               itr == cuts.end() ? false : itr->closed});
+      }
+    }
+  }
+
+  // Find the first cut to the right of where we start on this edge
+  auto edgeinfo = tile->edgeinfo(edge->edgeinfo_offset());
+  double distance_total_pct = src_pct;
+  auto cut_itr = std::find_if(cuts.cbegin(), cuts.cend(),
+                              [distance_total_pct](const decltype(cuts)::value_type& s) {
+                                return distance_total_pct <= s.percent_along;
+                              });
+  assert(cut_itr != cuts.cend());
+
+  // reservations
+  if (controller.attributes.at(kShapeAttributesTime)) {
+    leg.mutable_shape_attributes()->mutable_time()->Reserve(leg.shape_attributes().time_size() +
+                                                            shape.size() + cuts.size());
+  }
+  if (controller.attributes.at(kShapeAttributesLength)) {
+    leg.mutable_shape_attributes()->mutable_length()->Reserve(leg.shape_attributes().length_size() +
+                                                              shape.size() + cuts.size());
+  }
+  if (controller.attributes.at(kShapeAttributesSpeed)) {
+    leg.mutable_shape_attributes()->mutable_speed()->Reserve(leg.shape_attributes().speed_size() +
+                                                             shape.size() + cuts.size());
+  }
+  if (controller.attributes.at(kShapeAttributesSpeedLimit)) {
+    leg.mutable_shape_attributes()->mutable_speed_limit()->Reserve(
+        leg.shape_attributes().speed_limit_size() + shape.size() + cuts.size());
+  }
+
+  // Set the shape attributes
+  for (auto i = shape_begin + 1; i < shape.size(); ++i) {
+    // when speed changes we need to make a new shape point and continue from there
+    double distance = shape[i].Distance(shape[i - 1]); // meters
+    double distance_pct = distance / edge->length();
+    double next_total = distance_total_pct + distance_pct;
+    size_t shift = 0;
+    if (next_total > cut_itr->percent_along && std::next(cut_itr) != cuts.cend()) {
+      // Calculate where the cut point should be between these two existing shape points
+      auto coef = (cut_itr->percent_along - distance_total_pct) / (next_total - distance_total_pct);
+      auto point = shape[i - 1].PointAlongSegment(shape[i], coef);
+      shape.insert(shape.begin() + i, point);
+      next_total = cut_itr->percent_along;
+      distance *= coef;
+      shift = 1;
+    }
+    if (controller.attributes.at(kShapeAttributesClosure)) {
+      // Process closure annotations
+      if (cut_itr->closed) {
+        // Found a closure. Fetch a new annotation, or the last closure
+        // annotation if it does not have an end index set (meaning the shape
+        // is still within an existing closure)
+        ::valhalla::TripLeg_Closure* closure = fetch_or_create_closure_annotation(leg);
+        if (!closure->has_begin_shape_index()) {
+          closure->set_begin_shape_index(i - 1);
+        }
+      } else {
+        // Not a closure, check if we need to set the end of an existing
+        // closure annotation or not
+        ::valhalla::TripLeg_Closure* closure = fetch_last_closure_annotation(leg);
+        if (closure && !closure->has_end_shape_index()) {
+          closure->set_end_shape_index(i - 1);
+        }
+      }
+    }
+    distance_total_pct = next_total;
+    double time = distance / cut_itr->speed; // seconds
+
+    // Set shape attributes time per shape point if requested
+    if (controller.attributes.at(kShapeAttributesTime)) {
+      // convert time to milliseconds and then round to an integer
+      leg.mutable_shape_attributes()->add_time((time * kMillisecondPerSec) + 0.5);
+    }
+
+    // Set shape attributes length per shape point if requested
+    if (controller.attributes.at(kShapeAttributesLength)) {
+      // convert length to decimeters and then round to an integer
+      leg.mutable_shape_attributes()->add_length((distance * kDecimeterPerMeter) + 0.5);
+    }
+
+    // Set shape attributes speed per shape point if requested
+    if (controller.attributes.at(kShapeAttributesSpeed)) {
+      // convert speed to decimeters per sec and then round to an integer
+      leg.mutable_shape_attributes()->add_speed((distance * kDecimeterPerMeter / time) + 0.5);
+    }
+
+    // Set the maxspeed if requested
+    if (controller.attributes.at(kShapeAttributesSpeedLimit)) {
+      leg.mutable_shape_attributes()->add_speed_limit(edgeinfo.speed_limit());
+    }
+
+    // Set the incidents if we just cut or we are at the end
+    if ((shift || i == shape.size() - 1) && !cut_itr->incidents.empty()) {
+      for (const auto* incident : cut_itr->incidents) {
+        UpdateIncident(incidents.tile, leg, incident, i);
+      }
+    }
+
+    // If we just cut the shape we need to go on to the next marker only after setting the attribs
+    std::advance(cut_itr, shift);
   }
 }
 
@@ -142,194 +373,6 @@ void SetBoundingBox(TripLeg& trip_path, std::vector<PointLL>& shape) {
   LatLng* max_ll = trip_path.mutable_bbox()->mutable_max_ll();
   max_ll->set_lat(bbox.maxy());
   max_ll->set_lng(bbox.maxx());
-}
-
-// Associate RoadClass values to TripLeg proto
-constexpr valhalla::RoadClass kTripLegRoadClass[] = {valhalla::RoadClass::kMotorway,
-                                                     valhalla::RoadClass::kTrunk,
-                                                     valhalla::RoadClass::kPrimary,
-                                                     valhalla::RoadClass::kSecondary,
-                                                     valhalla::RoadClass::kTertiary,
-                                                     valhalla::RoadClass::kUnclassified,
-                                                     valhalla::RoadClass::kResidential,
-                                                     valhalla::RoadClass::kServiceOther};
-valhalla::RoadClass GetRoadClass(const baldr::RoadClass road_class) {
-  return kTripLegRoadClass[static_cast<int>(road_class)];
-}
-
-// Associate Surface values to TripLeg proto
-constexpr TripLeg_Surface kTripLegSurface[] =
-    {TripLeg_Surface_kPavedSmooth, TripLeg_Surface_kPaved,     TripLeg_Surface_kPavedRough,
-     TripLeg_Surface_kCompacted,   TripLeg_Surface_kDirt,      TripLeg_Surface_kGravel,
-     TripLeg_Surface_kPath,        TripLeg_Surface_kImpassable};
-TripLeg_Surface GetTripLegSurface(const Surface surface) {
-  return kTripLegSurface[static_cast<int>(surface)];
-}
-
-// Associate vehicle types to TripLeg proto
-// TODO - why doesn't these use an enum input?
-constexpr TripLeg_VehicleType kTripLegVehicleType[] =
-    {TripLeg_VehicleType::TripLeg_VehicleType_kCar,
-     TripLeg_VehicleType::TripLeg_VehicleType_kMotorcycle,
-     TripLeg_VehicleType::TripLeg_VehicleType_kAutoBus,
-     TripLeg_VehicleType::TripLeg_VehicleType_kTractorTrailer,
-     TripLeg_VehicleType::TripLeg_VehicleType_kMotorScooter};
-TripLeg_VehicleType GetTripLegVehicleType(const uint8_t type) {
-  return (type <= static_cast<uint8_t>(VehicleType::kMotorScooter)) ? kTripLegVehicleType[type]
-                                                                    : kTripLegVehicleType[0];
-}
-
-// Associate pedestrian types to TripLeg proto
-constexpr TripLeg_PedestrianType kTripLegPedestrianType[] =
-    {TripLeg_PedestrianType::TripLeg_PedestrianType_kFoot,
-     TripLeg_PedestrianType::TripLeg_PedestrianType_kWheelchair,
-     TripLeg_PedestrianType::TripLeg_PedestrianType_kSegway};
-TripLeg_PedestrianType GetTripLegPedestrianType(const uint8_t type) {
-  return (type <= static_cast<uint8_t>(PedestrianType::kSegway)) ? kTripLegPedestrianType[type]
-                                                                 : kTripLegPedestrianType[0];
-}
-
-// Associate bicycle types to TripLeg proto
-constexpr TripLeg_BicycleType kTripLegBicycleType[] =
-    {TripLeg_BicycleType::TripLeg_BicycleType_kRoad, TripLeg_BicycleType::TripLeg_BicycleType_kCross,
-     TripLeg_BicycleType::TripLeg_BicycleType_kHybrid,
-     TripLeg_BicycleType::TripLeg_BicycleType_kMountain};
-TripLeg_BicycleType GetTripLegBicycleType(const uint8_t type) {
-  return (type <= static_cast<uint8_t>(BicycleType::kMountain)) ? kTripLegBicycleType[type]
-                                                                : kTripLegBicycleType[0];
-}
-
-// Associate transit types to TripLeg proto
-constexpr TripLeg_TransitType kTripLegTransitType[] =
-    {TripLeg_TransitType::TripLeg_TransitType_kTram,
-     TripLeg_TransitType::TripLeg_TransitType_kMetro,
-     TripLeg_TransitType::TripLeg_TransitType_kRail,
-     TripLeg_TransitType::TripLeg_TransitType_kBus,
-     TripLeg_TransitType::TripLeg_TransitType_kFerry,
-     TripLeg_TransitType::TripLeg_TransitType_kCableCar,
-     TripLeg_TransitType::TripLeg_TransitType_kGondola,
-     TripLeg_TransitType::TripLeg_TransitType_kFunicular};
-TripLeg_TransitType GetTripLegTransitType(const TransitType transit_type) {
-  return kTripLegTransitType[static_cast<uint32_t>(transit_type)];
-}
-
-// Associate traversability values to TripLeg proto
-constexpr TripLeg_Traversability kTripLegTraversability[] = {TripLeg_Traversability_kNone,
-                                                             TripLeg_Traversability_kForward,
-                                                             TripLeg_Traversability_kBackward,
-                                                             TripLeg_Traversability_kBoth};
-TripLeg_Traversability GetTripLegTraversability(const Traversability traversability) {
-  return kTripLegTraversability[static_cast<uint32_t>(traversability)];
-}
-
-// Associate side of street to TripLeg proto
-constexpr valhalla::Location::SideOfStreet kTripLegSideOfStreet[] = {valhalla::Location::kNone,
-                                                                     valhalla::Location::kLeft,
-                                                                     valhalla::Location::kRight};
-valhalla::Location::SideOfStreet GetTripLegSideOfStreet(const valhalla::Location::SideOfStreet sos) {
-  return kTripLegSideOfStreet[static_cast<uint32_t>(sos)];
-}
-
-TripLeg_Node_Type GetTripLegNodeType(const NodeType node_type) {
-  switch (node_type) {
-    case NodeType::kStreetIntersection:
-      return TripLeg_Node_Type_kStreetIntersection;
-    case NodeType::kGate:
-      return TripLeg_Node_Type_kGate;
-    case NodeType::kBollard:
-      return TripLeg_Node_Type_kBollard;
-    case NodeType::kTollBooth:
-      return TripLeg_Node_Type_kTollBooth;
-    case NodeType::kTransitEgress:
-      return TripLeg_Node_Type_kTransitEgress;
-    case NodeType::kTransitStation:
-      return TripLeg_Node_Type_kTransitStation;
-    case NodeType::kMultiUseTransitPlatform:
-      return TripLeg_Node_Type_kTransitPlatform;
-    case NodeType::kBikeShare:
-      return TripLeg_Node_Type_kBikeShare;
-    case NodeType::kParking:
-      return TripLeg_Node_Type_kParking;
-    case NodeType::kMotorWayJunction:
-      return TripLeg_Node_Type_kMotorwayJunction;
-    case NodeType::kBorderControl:
-      return TripLeg_Node_Type_kBorderControl;
-  }
-  auto num = static_cast<uint8_t>(node_type);
-  throw std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) +
-                           " Unhandled NodeType: " + std::to_string(num));
-}
-
-// Associate cycle lane values to TripLeg proto
-constexpr TripLeg_CycleLane kTripLegCycleLane[] = {TripLeg_CycleLane_kNoCycleLane,
-                                                   TripLeg_CycleLane_kShared,
-                                                   TripLeg_CycleLane_kDedicated,
-                                                   TripLeg_CycleLane_kSeparated};
-TripLeg_CycleLane GetTripLegCycleLane(const CycleLane cyclelane) {
-  return kTripLegCycleLane[static_cast<uint32_t>(cyclelane)];
-}
-
-// Associate Use to TripLeg proto
-TripLeg_Use GetTripLegUse(const Use use) {
-  switch (use) {
-    case Use::kRoad:
-      return TripLeg_Use_kRoadUse;
-    case Use::kRamp:
-      return TripLeg_Use_kRampUse;
-    case Use::kTurnChannel:
-      return TripLeg_Use_kTurnChannelUse;
-    case Use::kTrack:
-      return TripLeg_Use_kTrackUse;
-    case Use::kDriveway:
-      return TripLeg_Use_kDrivewayUse;
-    case Use::kAlley:
-      return TripLeg_Use_kAlleyUse;
-    case Use::kParkingAisle:
-      return TripLeg_Use_kParkingAisleUse;
-    case Use::kEmergencyAccess:
-      return TripLeg_Use_kEmergencyAccessUse;
-    case Use::kDriveThru:
-      return TripLeg_Use_kDriveThruUse;
-    case Use::kCuldesac:
-      return TripLeg_Use_kCuldesacUse;
-    case Use::kCycleway:
-      return TripLeg_Use_kCyclewayUse;
-    case Use::kMountainBike:
-      return TripLeg_Use_kMountainBikeUse;
-    case Use::kSidewalk:
-      // return TripLeg_Use_kSidewalkUse;
-      return TripLeg_Use_kFootwayUse; // TODO: update when odin has been updated
-    case Use::kFootway:
-      return TripLeg_Use_kFootwayUse;
-    case Use::kSteps:
-      return TripLeg_Use_kStepsUse;
-    case Use::kPath:
-      return TripLeg_Use_kPathUse;
-    case Use::kPedestrian:
-      return TripLeg_Use_kPedestrianUse;
-    case Use::kBridleway:
-      return TripLeg_Use_kBridlewayUse;
-    case Use::kOther:
-      return TripLeg_Use_kOtherUse;
-    case Use::kFerry:
-      return TripLeg_Use_kFerryUse;
-    case Use::kRailFerry:
-      return TripLeg_Use_kRailFerryUse;
-    case Use::kRail:
-      return TripLeg_Use_kRailUse;
-    case Use::kBus:
-      return TripLeg_Use_kBusUse;
-    case Use::kEgressConnection:
-      return TripLeg_Use_kEgressConnectionUse;
-    case Use::kPlatformConnection:
-      return TripLeg_Use_kPlatformConnectionUse;
-    case Use::kTransitConnection:
-      return TripLeg_Use_kTransitConnectionUse;
-    // Should not see other values
-    default:
-      // TODO should we throw a runtime error?
-      return TripLeg_Use_kRoadUse;
-  }
 }
 
 /**
@@ -413,116 +456,6 @@ void SetHeadings(TripLeg_Edge* trip_edge,
 }
 
 /**
- * @param trip_node   Trip node to add transit nodes.
- * @param node        Start nodeinfo of the current edge.
- * @param startnode   Start node of the current edge.
- * @param start_tile  Tile of the start node.
- * @param graphtile   Graph tile of the current edge.
- * @param controller  Controller specifying attributes to add to trip edge.
- *
- */
-void AddTransitNodes(TripLeg_Node* trip_node,
-                     const NodeInfo* node,
-                     const GraphId& startnode,
-                     const GraphTile* start_tile,
-                     const GraphTile* graphtile,
-                     const AttributesController& controller) {
-
-  if (node->type() == NodeType::kTransitStation) {
-    const TransitStop* transit_station =
-        start_tile->GetTransitStop(start_tile->node(startnode)->stop_index());
-    TransitStationInfo* transit_station_info = trip_node->mutable_transit_station_info();
-
-    if (transit_station) {
-      // Set onstop_id if requested
-      if (controller.attributes.at(kNodeTransitStationInfoOnestopId) &&
-          transit_station->one_stop_offset()) {
-        transit_station_info->set_onestop_id(graphtile->GetName(transit_station->one_stop_offset()));
-      }
-
-      // Set name if requested
-      if (controller.attributes.at(kNodeTransitStationInfoName) && transit_station->name_offset()) {
-        transit_station_info->set_name(graphtile->GetName(transit_station->name_offset()));
-      }
-
-      // Set latitude and longitude
-      LatLng* stop_ll = transit_station_info->mutable_ll();
-      // Set transit stop lat/lon if requested
-      if (controller.attributes.at(kNodeTransitStationInfoLatLon)) {
-        PointLL ll = node->latlng(start_tile->header()->base_ll());
-        stop_ll->set_lat(ll.lat());
-        stop_ll->set_lng(ll.lng());
-      }
-    }
-  }
-
-  if (node->type() == NodeType::kTransitEgress) {
-    const TransitStop* transit_egress =
-        start_tile->GetTransitStop(start_tile->node(startnode)->stop_index());
-    TransitEgressInfo* transit_egress_info = trip_node->mutable_transit_egress_info();
-
-    if (transit_egress) {
-      // Set onstop_id if requested
-      if (controller.attributes.at(kNodeTransitEgressInfoOnestopId) &&
-          transit_egress->one_stop_offset()) {
-        transit_egress_info->set_onestop_id(graphtile->GetName(transit_egress->one_stop_offset()));
-      }
-
-      // Set name if requested
-      if (controller.attributes.at(kNodeTransitEgressInfoName) && transit_egress->name_offset()) {
-        transit_egress_info->set_name(graphtile->GetName(transit_egress->name_offset()));
-      }
-
-      // Set latitude and longitude
-      LatLng* stop_ll = transit_egress_info->mutable_ll();
-      // Set transit stop lat/lon if requested
-      if (controller.attributes.at(kNodeTransitEgressInfoLatLon)) {
-        PointLL ll = node->latlng(start_tile->header()->base_ll());
-        stop_ll->set_lat(ll.lat());
-        stop_ll->set_lng(ll.lng());
-      }
-    }
-  }
-}
-
-void SetTripEdgeRoadClass(TripLeg_Edge* trip_edge,
-                          const DirectedEdge* directededge,
-                          const GraphTile* graphtile,
-                          GraphReader& graphreader) {
-  trip_edge->set_road_class(GetRoadClass(directededge->classification()));
-  // If this is a ramp it may have been reclassified in graph enhancer.
-  // To restore the original road class for motorway_links, we check if any of the adjacent edges is
-  // a motorway.
-  if (directededge->use() == Use::kRamp) {
-    const DirectedEdge* opposing_edge = graphreader.GetOpposingEdge(directededge, graphtile);
-    for (const auto* edge : {directededge, opposing_edge}) {
-      if (!edge || !graphreader.GetGraphTile(edge->endnode(), graphtile)) {
-        // If this edge was invalid or we couldn't get the opposing edge's tile, skip
-        continue;
-      }
-      // check edges leaving node
-      for (const auto& adjacent_edge : graphtile->GetDirectedEdges(edge->endnode())) {
-        if (adjacent_edge.classification() == baldr::RoadClass::kMotorway) {
-          trip_edge->set_road_class(valhalla::RoadClass::kMotorway);
-          return;
-        }
-      }
-      // check transition nodes too
-      auto transition_nodes = graphtile->GetNodeTransitions(edge->endnode());
-      for (const auto& transition : transition_nodes) {
-        auto trans_tile = graphreader.GetGraphTile(transition.endnode());
-        for (const auto& adjacent_edge : trans_tile->GetDirectedEdges(transition.endnode())) {
-          if (adjacent_edge.classification() == baldr::RoadClass::kMotorway) {
-            trip_edge->set_road_class(valhalla::RoadClass::kMotorway);
-            return;
-          }
-        }
-      }
-    }
-  }
-}
-
-/**
  * Add trip edge. (TODO more comments)
  * @param  controller         Controller to determine which attributes to set.
  * @param  edge               Identifier of an edge within the tiled, hierarchical graph.
@@ -534,7 +467,7 @@ void SetTripEdgeRoadClass(TripLeg_Edge* trip_edge,
  * @param  trip_node          Trip node to add the edge information to.
  * @param  graphtile          Graph tile for accessing data.
  * @param  second_of_week     The time, from the beginning of the week in seconds at which
- *                            the path entered this edge
+ *                            the path entered this edge (always monday at noon on timeless route)
  * @param  start_node_idx     The start node index
  * @param  has_junction_name  True if named junction exists, false otherwise
  * @param  start_tile         The start tile of the start node
@@ -550,13 +483,12 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
                           const DirectedEdge* directededge,
                           const bool drive_on_right,
                           TripLeg_Node* trip_node,
-                          const GraphTile* graphtile,
-                          GraphReader& graphreader,
+                          const graph_tile_ptr& graphtile,
                           const uint32_t second_of_week,
                           const uint32_t start_node_idx,
                           const bool has_junction_name,
-                          const GraphTile* start_tile,
-                          const bool has_time_restrictions) {
+                          const graph_tile_ptr& start_tile,
+                          const uint8_t restrictions_idx) {
 
   // Index of the directed edge within the tile
   uint32_t idx = edge.id();
@@ -569,10 +501,22 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
   // Add names to edge if requested
   if (controller.attributes.at(kEdgeNames)) {
     auto names_and_types = edgeinfo.GetNamesAndTypes();
+    trip_edge->mutable_name()->Reserve(names_and_types.size());
     for (const auto& name_and_type : names_and_types) {
       auto* trip_edge_name = trip_edge->mutable_name()->Add();
       trip_edge_name->set_value(name_and_type.first);
       trip_edge_name->set_is_route_number(name_and_type.second);
+    }
+  }
+
+  // Add tagged names to the edge if requested
+  if (controller.attributes.at(kEdgeTaggedNames)) {
+    auto tagged_names_and_types = edgeinfo.GetTaggedNamesAndTypes();
+    trip_edge->mutable_tagged_name()->Reserve(tagged_names_and_types.size());
+    for (const auto& tagged_name_and_type : tagged_names_and_types) {
+      auto* trip_edge_tag_name = trip_edge->mutable_tagged_name()->Add();
+      trip_edge_tag_name->set_value(tagged_name_and_type.first);
+      trip_edge_tag_name->set_type(static_cast<TaggedName_Type>(tagged_name_and_type.second));
     }
   }
 
@@ -647,6 +591,16 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
             }
             break;
           }
+          case Sign::Type::kGuidanceViewSignboard: {
+            if (controller.attributes.at(kEdgeSignGuidanceViewSignboard)) {
+              auto* trip_sign_guidance_view_signboard =
+                  trip_sign->mutable_guidance_view_signboards()->Add();
+              trip_sign_guidance_view_signboard->set_text(sign.text());
+              trip_sign_guidance_view_signboard->set_is_route_number(sign.is_route_num());
+            }
+            break;
+          }
+          default: { break; }
         }
       }
     }
@@ -668,6 +622,8 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
             }
             break;
           }
+          default:
+            break;
         }
       }
     }
@@ -676,6 +632,7 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
   // If turn lanes exist
   if (directededge->turnlanes()) {
     auto turnlanes = graphtile->turnlanes(idx);
+    trip_edge->mutable_turn_lanes()->Reserve(turnlanes.size());
     for (auto tl : turnlanes) {
       TurnLane* turn_lane = trip_edge->add_turn_lanes();
       turn_lane->set_directions_mask(tl);
@@ -684,17 +641,19 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
 
   // Set road class if requested
   if (controller.attributes.at(kEdgeRoadClass)) {
-    SetTripEdgeRoadClass(trip_edge, directededge, graphtile, graphreader);
+    trip_edge->set_road_class(GetRoadClass(directededge->classification()));
   }
 
   // Set speed if requested
   if (controller.attributes.at(kEdgeSpeed)) {
+    // TODO: if this is a transit edge then the costing will throw
     // TODO: could get better precision speed here by calling GraphTile::GetSpeed but we'd need to
-    // know whether or not the costing actually cares about the speed of the edge. Perhaps a refactor
-    // of costing to have a GetSpeed function which EdgeCost calls internally but which we can also
-    // call externally
+    // know whether or not the costing actually cares about the speed of the edge. Perhaps a
+    // refactor of costing to have a GetSpeed function which EdgeCost calls internally but which we
+    // can also call externally
+    uint8_t flow_sources;
     auto speed = directededge->length() /
-                 costing->EdgeCost(directededge, graphtile, second_of_week).secs * 3.6;
+                 costing->EdgeCost(directededge, graphtile, second_of_week, flow_sources).secs * 3.6;
     trip_edge->set_speed(speed);
   }
 
@@ -740,9 +699,14 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
     }
   }
 
-  if (has_time_restrictions) {
-    trip_edge->set_has_time_restrictions(has_time_restrictions);
+  if (directededge->access_restriction() && restrictions_idx != kInvalidRestriction) {
+    const std::vector<baldr::AccessRestriction>& restrictions =
+        graphtile->GetAccessRestrictions(edge.id(), costing->access_mode());
+    trip_edge->mutable_restriction()->set_type(
+        static_cast<uint32_t>(restrictions[restrictions_idx].type()));
   }
+
+  trip_edge->set_has_time_restrictions(restrictions_idx != kInvalidRestriction);
 
   // Set the trip path use based on directed edge use if requested
   if (controller.attributes.at(kEdgeUse)) {
@@ -787,6 +751,10 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
   // Set surface if requested
   if (controller.attributes.at(kEdgeSurface)) {
     trip_edge->set_surface(GetTripLegSurface(directededge->surface()));
+  }
+
+  if (directededge->destonly() && controller.attributes.at(kEdgeDestinationOnly)) {
+    trip_edge->set_destination_only(directededge->destonly());
   }
 
   // Set the mode and travel type
@@ -872,7 +840,9 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
   }
 
   if (directededge->laneconnectivity() && controller.attributes.at(kEdgeLaneConnectivity)) {
-    for (const auto& l : graphtile->GetLaneConnectivity(idx)) {
+    auto laneconnectivity = graphtile->GetLaneConnectivity(idx);
+    trip_edge->mutable_lane_connectivity()->Reserve(laneconnectivity.size());
+    for (const auto& l : laneconnectivity) {
       TripLeg_LaneConnectivity* path_lane = trip_edge->add_lane_connectivity();
       path_lane->set_from_way_id(l.from());
       path_lane->set_to_lanes(l.to_lanes());
@@ -900,6 +870,11 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
 
   if (controller.attributes.at(kEdgeDensity)) {
     trip_edge->set_density(directededge->density());
+  }
+
+  if (controller.attributes.at(kEdgeIsUrban)) {
+    bool is_urban = (directededge->density() > 8) ? true : false;
+    trip_edge->set_is_urban(is_urban);
   }
 
   if (controller.attributes.at(kEdgeSpeedLimit)) {
@@ -1016,86 +991,85 @@ TripLeg_Edge* AddTripEdge(const AttributesController& controller,
 }
 
 /**
- * Add trip intersecting edge.
- * @param  controller   Controller to determine which attributes to set.
- * @param  directededge Directed edge on the path.
- * @param  prev_de  Previous directed edge on the path.
- * @param  local_edge_index  Index of the local intersecting path edge at intersection.
- * @param  nodeinfo  Node information of the intersection.
- * @param  trip_node  Trip node that will store the intersecting edge information.
- * @param  intersecting_de Intersecting directed edge. Will be nullptr except when
- *                         on the local hierarchy.
+ * This adds cost information at every node using supplementary costings provided at request time
+ * There are some limitations here:
+ * For multipoint routes the date_time used will not reflect the time offset that would have been if
+ * you used the supplementary costing instead it is using the time at which the primary costing
+ * arrived at the start of the leg
+ * The same limitation is also true for arrive by routes in which the start time of the leg will be
+ * the start time computed via the time offset from the primary costings time estimation
+ * @param options     the api request options
+ * @param src_pct     percent along the first edge of the path the start location snapped
+ * @param tgt_pct     percent along the last edge of the path the end location snapped
+ * @param time_info   the time tracking information representing the local time before
+ *                    traversing the first edge
+ * @param invariant   static date_time, dont offset the time as the path lengthens
+ * @param reader      graph reader for tile access
+ * @param leg         the already constructed trip leg to which extra cost information is added
  */
-void AddTripIntersectingEdge(const AttributesController& controller,
-                             const DirectedEdge* directededge,
-                             const DirectedEdge* prev_de,
-                             uint32_t local_edge_index,
-                             const NodeInfo* nodeinfo,
-                             TripLeg_Node* trip_node,
-                             const DirectedEdge* intersecting_de) {
-  TripLeg_IntersectingEdge* itersecting_edge = trip_node->add_intersecting_edge();
-
-  // Set the heading for the intersecting edge if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeBeginHeading)) {
-    itersecting_edge->set_begin_heading(nodeinfo->heading(local_edge_index));
+// TODO: care about the src and tgt pct per edge not just on first and last edges
+void AccumulateRecostingInfoForward(const valhalla::Options& options,
+                                    float src_pct,
+                                    float tgt_pct,
+                                    const baldr::TimeInfo& time_info,
+                                    const bool invariant,
+                                    valhalla::baldr::GraphReader& reader,
+                                    valhalla::TripLeg& leg) {
+  // bail if this is empty for some reason
+  if (leg.node_size() == 0) {
+    return;
   }
 
-  Traversability traversability = Traversability::kNone;
-  // Determine walkability
-  if (intersecting_de->forwardaccess() & kPedestrianAccess) {
-    traversability = (intersecting_de->reverseaccess() & kPedestrianAccess)
-                         ? Traversability::kBoth
-                         : Traversability::kForward;
-  } else {
-    traversability = (intersecting_de->reverseaccess() & kPedestrianAccess)
-                         ? Traversability::kBackward
-                         : Traversability::kNone;
-  }
-  // Set the walkability flag for the intersecting edge if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeWalkability)) {
-    itersecting_edge->set_walkability(GetTripLegTraversability(traversability));
-  }
+  // setup a callback for the recosting to get each edge
+  auto in_itr = leg.node().begin();
+  sif::EdgeCallback edge_cb = [&in_itr]() -> baldr::GraphId {
+    auto edge_id = in_itr->has_edge() ? baldr::GraphId(in_itr->edge().id()) : baldr::GraphId{};
+    ++in_itr;
+    return edge_id;
+  };
 
-  traversability = Traversability::kNone;
-  // Determine cyclability
-  if (intersecting_de->forwardaccess() & kBicycleAccess) {
-    traversability = (intersecting_de->reverseaccess() & kBicycleAccess) ? Traversability::kBoth
-                                                                         : Traversability::kForward;
-  } else {
-    traversability = (intersecting_de->reverseaccess() & kBicycleAccess) ? Traversability::kBackward
-                                                                         : Traversability::kNone;
-  }
-  // Set the cyclability flag for the intersecting edge if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeCyclability)) {
-    itersecting_edge->set_cyclability(GetTripLegTraversability(traversability));
-  }
+  // setup a callback for the recosting to tell us about the new label each made
+  auto out_itr = leg.mutable_node()->begin();
+  sif::LabelCallback label_cb = [&out_itr](const sif::EdgeLabel& label) -> void {
+    // get the turn cost at this node
+    out_itr->mutable_recosts()->rbegin()->mutable_transition_cost()->set_seconds(
+        label.transition_cost().secs);
+    out_itr->mutable_recosts()->rbegin()->mutable_transition_cost()->set_cost(
+        label.transition_cost().cost);
+    // get the elapsed time at the end of this labels edge and hang it on the next node
+    ++out_itr;
+    out_itr->mutable_recosts()->Add()->mutable_elapsed_cost()->set_seconds(label.cost().secs);
+    out_itr->mutable_recosts()->rbegin()->mutable_elapsed_cost()->set_cost(label.cost().cost);
+  };
 
-  // Set the driveability flag for the intersecting edge if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeDriveability)) {
-    itersecting_edge->set_driveability(
-        GetTripLegTraversability(nodeinfo->local_driveability(local_edge_index)));
-  }
-
-  // Set the previous/intersecting edge name consistency if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeFromEdgeNameConsistency)) {
-    bool name_consistency =
-        (prev_de == nullptr) ? false : prev_de->name_consistency(local_edge_index);
-    itersecting_edge->set_prev_name_consistency(name_consistency);
-  }
-
-  // Set the current/intersecting edge name consistency if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeToEdgeNameConsistency)) {
-    itersecting_edge->set_curr_name_consistency(directededge->name_consistency(local_edge_index));
-  }
-
-  // Set the use for the intersecting edge if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeUse)) {
-    itersecting_edge->set_use(GetTripLegUse(intersecting_de->use()));
-  }
-
-  // Set the road class for the intersecting edge if requested
-  if (controller.attributes.at(kNodeIntersectingEdgeRoadClass)) {
-    itersecting_edge->set_road_class(GetRoadClass(intersecting_de->classification()));
+  // do each recosting
+  sif::CostFactory factory;
+  for (const auto& recosting : options.recostings()) {
+    // get the costing
+    auto costing = factory.Create(recosting);
+    // reset to the beginning of the route
+    in_itr = leg.node().begin();
+    out_itr = leg.mutable_node()->begin();
+    // no elapsed time yet at the start of the leg
+    out_itr->mutable_recosts()->Add()->mutable_elapsed_cost()->set_seconds(0);
+    out_itr->mutable_recosts()->rbegin()->mutable_elapsed_cost()->set_cost(0);
+    // do the recosting for this costing
+    try {
+      sif::recost_forward(reader, *costing, edge_cb, label_cb, src_pct, tgt_pct, time_info,
+                          invariant);
+      // no turn cost at the end of the leg
+      out_itr->mutable_recosts()->rbegin()->mutable_transition_cost()->set_seconds(0);
+      out_itr->mutable_recosts()->rbegin()->mutable_transition_cost()->set_cost(0);
+    } // couldnt be recosted (difference in access for example) so we fill it with nulls to show this
+    catch (...) {
+      int should_have = leg.node(0).recosts_size();
+      for (auto& node : *leg.mutable_node()) {
+        if (node.recosts_size() == should_have) {
+          node.mutable_recosts()->RemoveLast();
+        }
+        node.mutable_recosts()->Add();
+      }
+    }
   }
 }
 
@@ -1105,23 +1079,26 @@ namespace valhalla {
 namespace thor {
 
 void TripLegBuilder::Build(
+    const valhalla::Options& options,
     const AttributesController& controller,
     GraphReader& graphreader,
-    const std::shared_ptr<sif::DynamicCost>* mode_costing,
+    const sif::mode_costing_t& mode_costing,
     const std::vector<PathInfo>::const_iterator path_begin,
     const std::vector<PathInfo>::const_iterator path_end,
     valhalla::Location& origin,
     valhalla::Location& dest,
     const std::list<valhalla::Location>& through_loc,
     TripLeg& trip_path,
+    const std::vector<std::string>& algorithms,
     const std::function<void()>* interrupt_callback,
-    std::unordered_map<size_t, std::pair<EdgeTrimmingInfo, EdgeTrimmingInfo>>* edge_trimming,
-    float trim_begin,
-    float trim_end) {
+    std::unordered_map<size_t, std::pair<EdgeTrimmingInfo, EdgeTrimmingInfo>>* edge_trimming) {
   // Test interrupt prior to building trip path
   if (interrupt_callback) {
     (*interrupt_callback)();
   }
+
+  // Remember what algorithms were used to create this leg
+  *trip_path.mutable_algorithms() = {algorithms.begin(), algorithms.end()};
 
   // Set origin, any through locations, and destination. Origin and
   // destination are assumed to be breaks.
@@ -1129,12 +1106,13 @@ void TripLegBuilder::Build(
   auto* tp_orig = trip_path.mutable_location(0);
   auto* tp_dest = trip_path.mutable_location(trip_path.location_size() - 1);
 
-  // TODO: use TimeInfo
-  uint32_t origin_second_of_week = kInvalidSecondsOfWeek;
-  if (origin.has_date_time()) {
-    origin_second_of_week = DateTime::day_of_week(origin.date_time()) * kSecondsPerDay +
-                            DateTime::seconds_from_midnight(origin.date_time());
-  }
+  // Keep track of the time
+  baldr::DateTime::tz_sys_info_cache_t tz_cache;
+  const auto forward_time_info = baldr::TimeInfo::make(origin, graphreader, &tz_cache);
+
+  // check if we should use static time or offset time as the path lengthens
+  const bool invariant =
+      options.has_date_time_type() && options.date_time_type() == Options::invariant;
 
   // Create an array of travel types per mode
   uint8_t travel_types[4];
@@ -1146,13 +1124,13 @@ void TripLegBuilder::Build(
   // opposing edge then use the opposing index to get the opposing edge, and its end node is the
   // begin node of the original edge
   auto* first_edge = graphreader.GetGraphTile(path_begin->edgeid)->directededge(path_begin->edgeid);
-  auto* first_tile = graphreader.GetGraphTile(first_edge->endnode());
+  auto first_tile = graphreader.GetGraphTile(first_edge->endnode());
   auto* first_node = first_tile->node(first_edge->endnode());
   GraphId startnode =
       first_tile->directededge(first_node->edge_index() + first_edge->opp_index())->endnode();
 
   // Partial edge at the start and side of street (sos)
-  float start_pct;
+  float start_pct = 0.;
   valhalla::Location::SideOfStreet start_sos =
       valhalla::Location::SideOfStreet::Location_SideOfStreet_kNone;
   PointLL start_vrt;
@@ -1176,7 +1154,7 @@ void TripLegBuilder::Build(
   }
 
   // Partial edge at the end
-  float end_pct;
+  float end_pct = 1.;
   valhalla::Location::SideOfStreet end_sos =
       valhalla::Location::SideOfStreet::Location_SideOfStreet_kNone;
   PointLL end_vrt;
@@ -1203,134 +1181,22 @@ void TripLegBuilder::Build(
   std::unordered_map<AdminInfo, uint32_t, AdminInfo::AdminInfoHasher> admin_info_map;
   std::vector<AdminInfo> admin_info_list;
 
-  // initialize shape_attributes
-  if (controller.category_attribute_enabled(kShapeAttributesCategory)) {
-    trip_path.mutable_shape_attributes();
-  }
-
-  // If the path was only one edge we have a special case
-  if ((path_end - path_begin) == 1) {
-    const GraphTile* tile = graphreader.GetGraphTile(path_begin->edgeid);
-    const DirectedEdge* edge = tile->directededge(path_begin->edgeid);
-
-    // Get the shape. Reverse if the directed edge direction does
-    // not match the traversal direction (based on start and end percent).
-    auto shape = tile->edgeinfo(edge->edgeinfo_offset()).shape();
-    if (edge->forward() != (start_pct < end_pct)) {
-      std::reverse(shape.begin(), shape.end());
-    }
-
-    // If traversing the opposing direction: adjust start and end percent
-    // and reverse the edge and side of street if traversing the opposite
-    // direction
-    if (start_pct > end_pct) {
-      start_pct = 1.0f - start_pct;
-      end_pct = 1.0f - end_pct;
-      edge = graphreader.GetOpposingEdge(path_begin->edgeid, tile);
-      if (end_sos == valhalla::Location::SideOfStreet::Location_SideOfStreet_kLeft) {
-        tp_dest->set_side_of_street(
-            GetTripLegSideOfStreet(valhalla::Location::SideOfStreet::Location_SideOfStreet_kRight));
-      } else if (end_sos == valhalla::Location::SideOfStreet::Location_SideOfStreet_kRight) {
-        tp_dest->set_side_of_street(
-            GetTripLegSideOfStreet(valhalla::Location::SideOfStreet::Location_SideOfStreet_kLeft));
-      }
-    }
-
-    float total = static_cast<float>(edge->length());
-    trim_shape(start_pct * total, start_vrt, end_pct * total, end_vrt, shape);
-
-    // Driving on right from the start of the edge?
-    const GraphId start_node = graphreader.GetOpposingEdge(path_begin->edgeid)->endnode();
-    bool drive_on_right = graphreader.nodeinfo(start_node)->drive_on_right();
-
-    // Add trip edge
-    auto trip_edge =
-        AddTripEdge(controller, path_begin->edgeid, path_begin->trip_id, 0, path_begin->mode,
-                    travel_types[static_cast<int>(path_begin->mode)],
-                    mode_costing[static_cast<uint32_t>(path_begin->mode)], edge, drive_on_right,
-                    trip_path.add_node(), tile, graphreader, origin_second_of_week, startnode.id(),
-                    false, nullptr, path_begin->has_time_restrictions);
-
-    // Set length if requested. Convert to km
-    if (controller.attributes.at(kEdgeLength)) {
-      float km = std::max((edge->length() * kKmPerMeter * std::abs(end_pct - start_pct)), 0.001f);
-      trip_edge->set_length(km);
-    }
-
-    // Set begin shape index if requested
-    if (controller.attributes.at(kEdgeBeginShapeIndex)) {
-      trip_edge->set_begin_shape_index(0);
-    }
-    // Set end shape index if requested
-    if (controller.attributes.at(kEdgeEndShapeIndex)) {
-      trip_edge->set_end_shape_index(shape.size() - 1);
-    }
-
-    // Set shape attributes
-    SetShapeAttributes(controller, tile, edge, mode_costing[static_cast<int>(path_begin->mode)],
-                       shape.begin(), shape.end(), trip_path, origin_second_of_week,
-                       end_pct - start_pct);
-
-    // Set begin and end heading if requested. Uses shape so
-    // must be done after the edge's shape has been added.
-    SetHeadings(trip_edge, controller, edge, shape, 0);
-
-    auto* node = trip_path.add_node();
-    if (controller.attributes.at(kNodeElapsedTime)) {
-      node->set_elapsed_time(path_begin->elapsed_time - trim_begin - trim_end);
-    }
-
-    const GraphTile* end_tile = graphreader.GetGraphTile(edge->endnode());
-    if (end_tile == nullptr) {
-      if (controller.attributes.at(kNodeaAdminIndex)) {
-        node->set_admin_index(0);
-      }
-    } else {
-      if (controller.attributes.at(kNodeaAdminIndex)) {
-        node->set_admin_index(
-            GetAdminIndex(end_tile->admininfo(end_tile->node(edge->endnode())->admin_index()),
-                          admin_info_map, admin_info_list));
-      }
-    }
-
-    // Set the bounding box of the shape
-    SetBoundingBox(trip_path, shape);
-
-    // Set shape if requested
-    if (controller.attributes.at(kShape)) {
-      trip_path.set_shape(encode<std::vector<PointLL>>(shape));
-    }
-
-    if (controller.attributes.at(kOsmChangeset)) {
-      trip_path.set_osm_changeset(tile->header()->dataset_id());
-    }
-
-    // Assign the trip path admins
-    AssignAdmins(controller, trip_path, admin_info_list);
-
-    // Trivial path is done
-    return;
-  }
-
   // Iterate through path
-  bool is_first_edge = true;
-  double elapsedtime = 0;
-  uint32_t block_id = 0;
   uint32_t prior_opp_local_index = -1;
   std::vector<PointLL> trip_shape;
-  std::string arrival_time;
-  bool assumed_schedule = false;
   uint64_t osmchangeset = 0;
   size_t edge_index = 0;
   const DirectedEdge* prev_de = nullptr;
-  const GraphTile* graphtile = nullptr;
-  uint32_t origin_epoch = 0;
-  // TODO: this is temp until we use transit stop type from transitland
-  TransitPlatformInfo_Type prev_transit_node_type = TransitPlatformInfo_Type_kStop;
+  graph_tile_ptr graphtile = nullptr;
+  TimeInfo time_info = forward_time_info;
+  // remember that MultimodalBuilder keeps 'time_info' as reference,
+  // so we should care about 'time_info' updates during iterations
+  MultimodalBuilder multimodal_builder(origin, time_info);
 
+  // prepare to make some edges!
+  trip_path.mutable_node()->Reserve((path_end - path_begin) + 1);
   for (auto edge_itr = path_begin; edge_itr != path_end; ++edge_itr, ++edge_index) {
     const GraphId& edge = edge_itr->edgeid;
-    const uint32_t trip_id = edge_itr->trip_id;
     graphtile = graphreader.GetGraphTile(edge, graphtile);
     const DirectedEdge* directededge = graphtile->directededge(edge);
     const sif::TravelMode mode = edge_itr->mode;
@@ -1338,28 +1204,22 @@ void TripLegBuilder::Build(
     const auto& costing = mode_costing[static_cast<uint32_t>(mode)];
 
     // Set node attributes - only set if they are true since they are optional
-    const GraphTile* start_tile = graphtile;
-    start_tile = graphreader.GetGraphTile(startnode, start_tile);
+    graph_tile_ptr start_tile = graphtile;
+    graphreader.GetGraphTile(startnode, start_tile);
     const NodeInfo* node = start_tile->node(startnode);
 
     if (osmchangeset == 0 && controller.attributes.at(kOsmChangeset)) {
       osmchangeset = start_tile->header()->dataset_id();
     }
 
-    // cache this the first time
-    if (origin.has_date_time() && origin_epoch == 0) {
-      origin_epoch =
-          DateTime::seconds_since_epoch(origin.date_time(),
-                                        DateTime::get_tz_db().from_index(node->timezone()));
-    }
+    const bool is_first_edge = edge_itr == path_begin;
+    const bool is_last_edge = edge_itr == (path_end - 1);
 
     // have to always compute the offset in case the timezone changes along the path
     // we could cache the timezone and just add seconds when the timezone doesnt change
-    uint32_t second_of_week = kInvalidSecondsOfWeek;
-    if (origin_epoch != 0) {
-      second_of_week = DateTime::second_of_week(origin_epoch + static_cast<uint32_t>(elapsedtime),
-                                                DateTime::get_tz_db().from_index(node->timezone()));
-    }
+    const float seconds_offset =
+        (is_first_edge || invariant) ? 0.f : std::prev(edge_itr)->elapsed_cost.secs;
+    time_info = forward_time_info.forward(seconds_offset, static_cast<int>(node->timezone()));
 
     // Add a node to the trip path and set its attributes.
     TripLeg_Node* trip_node = trip_path.add_node();
@@ -1376,17 +1236,19 @@ void TripLegBuilder::Build(
 
     // Assign the elapsed time from the start of the leg
     if (controller.attributes.at(kNodeElapsedTime)) {
-      trip_node->set_elapsed_time(elapsedtime);
-    }
-
-    // Update elapsed time at the end of the edge, store this at the next node.
-    elapsedtime = edge_itr->elapsed_time - trim_begin;
-    if (edge_itr == path_end - 1) {
-      elapsedtime -= trim_end;
+      if (edge_itr == path_begin) {
+        trip_node->mutable_cost()->mutable_elapsed_cost()->set_seconds(0);
+        trip_node->mutable_cost()->mutable_elapsed_cost()->set_cost(0);
+      } else {
+        trip_node->mutable_cost()->mutable_elapsed_cost()->set_seconds(
+            std::prev(edge_itr)->elapsed_cost.secs);
+        trip_node->mutable_cost()->mutable_elapsed_cost()->set_cost(
+            std::prev(edge_itr)->elapsed_cost.cost);
+      }
     }
 
     // Assign the admin index
-    if (controller.attributes.at(kNodeaAdminIndex)) {
+    if (controller.attributes.at(kNodeAdminIndex)) {
       trip_node->set_admin_index(
           GetAdminIndex(start_tile->admininfo(node->admin_index()), admin_info_map, admin_info_list));
     }
@@ -1398,201 +1260,30 @@ void TripLegBuilder::Build(
       }
     }
 
-    if (controller.attributes.at(kNodeTransitionTime) && edge_itr->turn_cost > 0) {
-      trip_node->set_transition_time(edge_itr->turn_cost);
+    if (controller.attributes.at(kNodeTransitionTime)) {
+      trip_node->mutable_cost()->mutable_transition_cost()->set_seconds(
+          edge_itr->transition_cost.secs);
+      trip_node->mutable_cost()->mutable_transition_cost()->set_cost(edge_itr->transition_cost.cost);
     }
 
-    AddTransitNodes(trip_node, node, startnode, start_tile, graphtile, controller);
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Add transit information if this is a transit stop. TODO - can we move
-    // this to another method?
-    if (node->is_transit()) {
-      // Get the transit stop information and add transit stop info
-      const TransitStop* transit_platform = start_tile->GetTransitStop(node->stop_index());
-      TransitPlatformInfo* transit_platform_info = trip_node->mutable_transit_platform_info();
-
-      // TODO: for now we will set to station for rail and stop for others
-      //       in future, we will set based on transitland value
-      // Set type
-      if (directededge->use() == Use::kRail) {
-        // Set node transit info type if requested
-        if (controller.attributes.at(kNodeTransitPlatformInfoType)) {
-          transit_platform_info->set_type(TransitPlatformInfo_Type_kStation);
-        }
-        prev_transit_node_type = TransitPlatformInfo_Type_kStation;
-      } else if (directededge->use() == Use::kPlatformConnection) {
-        // Set node transit info type if requested
-        if (controller.attributes.at(kNodeTransitPlatformInfoType)) {
-          transit_platform_info->set_type(prev_transit_node_type);
-        }
-      } else { // bus logic
-        // Set node transit info type if requested
-        if (controller.attributes.at(kNodeTransitPlatformInfoType)) {
-          transit_platform_info->set_type(TransitPlatformInfo_Type_kStop);
-        }
-        prev_transit_node_type = TransitPlatformInfo_Type_kStop;
-      }
-
-      if (transit_platform) {
-        // Set onstop_id if requested
-        if (controller.attributes.at(kNodeTransitPlatformInfoOnestopId) &&
-            transit_platform->one_stop_offset()) {
-          transit_platform_info->set_onestop_id(
-              graphtile->GetName(transit_platform->one_stop_offset()));
-        }
-
-        // Set name if requested
-        if (controller.attributes.at(kNodeTransitPlatformInfoName) &&
-            transit_platform->name_offset()) {
-          transit_platform_info->set_name(graphtile->GetName(transit_platform->name_offset()));
-        }
-
-        // save station name and info for all platforms.
-        const DirectedEdge* dir_edge = start_tile->directededge(node->edge_index());
-        for (uint32_t index = 0; index < node->edge_count(); ++index, dir_edge++) {
-          if (dir_edge->use() == Use::kPlatformConnection) {
-            GraphId endnode = dir_edge->endnode();
-            const GraphTile* endtile = graphreader.GetGraphTile(endnode);
-            const NodeInfo* nodeinfo2 = endtile->node(endnode);
-            const TransitStop* transit_station = endtile->GetTransitStop(nodeinfo2->stop_index());
-
-            // Set station onstop_id if requested
-            if (controller.attributes.at(kNodeTransitPlatformInfoStationOnestopId) &&
-                transit_station->one_stop_offset()) {
-              transit_platform_info->set_station_onestop_id(
-                  endtile->GetName(transit_station->one_stop_offset()));
-            }
-
-            // Set station name if requested
-            if (controller.attributes.at(kNodeTransitPlatformInfoStationName) &&
-                transit_station->name_offset()) {
-              transit_platform_info->set_station_name(
-                  endtile->GetName(transit_station->name_offset()));
-            }
-
-            // only one de to station exists.  we are done.
-            break;
-          }
-        }
-
-        // Set latitude and longitude
-        LatLng* stop_ll = transit_platform_info->mutable_ll();
-        // Set transit stop lat/lon if requested
-        if (controller.attributes.at(kNodeTransitPlatformInfoLatLon)) {
-          PointLL ll = node->latlng(start_tile->header()->base_ll());
-          stop_ll->set_lat(ll.lat());
-          stop_ll->set_lng(ll.lng());
-        }
-      }
-
-      // Set the arrival time at this node (based on schedule from last trip
-      // departure) if requested
-      if (controller.attributes.at(kNodeTransitPlatformInfoArrivalDateTime) &&
-          !arrival_time.empty()) {
-        transit_platform_info->set_arrival_date_time(arrival_time);
-      }
-
-      // If this edge has a trip id then there is a transit departure
-      if (trip_id) {
-
-        const TransitDeparture* transit_departure =
-            graphtile->GetTransitDeparture(graphtile->directededge(edge.id())->lineid(), trip_id,
-                                           second_of_week % kSecondsPerDay);
-
-        assumed_schedule = false;
-        uint32_t date, day = 0;
-        if (origin.has_date_time()) {
-          date = DateTime::days_from_pivot_date(DateTime::get_formatted_date(origin.date_time()));
-
-          if (graphtile->header()->date_created() > date) {
-            // Set assumed schedule if requested
-            if (controller.attributes.at(kNodeTransitPlatformInfoAssumedSchedule)) {
-              transit_platform_info->set_assumed_schedule(true);
-            }
-            assumed_schedule = true;
-          } else {
-            day = date - graphtile->header()->date_created();
-            if (day > graphtile->GetTransitSchedule(transit_departure->schedule_index())->end_day()) {
-              // Set assumed schedule if requested
-              if (controller.attributes.at(kNodeTransitPlatformInfoAssumedSchedule)) {
-                transit_platform_info->set_assumed_schedule(true);
-              }
-              assumed_schedule = true;
-            }
-          }
-        }
-
-        // TODO: all of the duration stuff below assumes the transit departure is on the same day as
-        // the origin date time. if the trip took more than one day this will not be the case and
-        // negative durations can occur
-        if (transit_departure) {
-
-          std::string dt = DateTime::get_duration(origin.date_time(),
-                                                  (transit_departure->departure_time() -
-                                                   (origin_second_of_week % kSecondsPerDay)),
-                                                  DateTime::get_tz_db().from_index(node->timezone()));
-
-          std::size_t found = dt.find_last_of(' '); // remove tz abbrev.
-          if (found != std::string::npos) {
-            dt = dt.substr(0, found);
-          }
-
-          // Set departure time from this transit stop if requested
-          if (controller.attributes.at(kNodeTransitPlatformInfoDepartureDateTime)) {
-            transit_platform_info->set_departure_date_time(dt);
-          }
-
-          // TODO:  set removed tz abbrev on transit_platform_info for departure.
-
-          // Copy the arrival time for use at the next transit stop
-          arrival_time = DateTime::get_duration(origin.date_time(),
-                                                (transit_departure->departure_time() +
-                                                 transit_departure->elapsed_time()) -
-                                                    (origin_second_of_week % kSecondsPerDay),
-                                                DateTime::get_tz_db().from_index(node->timezone()));
-
-          found = arrival_time.find_last_of(' '); // remove tz abbrev.
-          if (found != std::string::npos) {
-            arrival_time = arrival_time.substr(0, found);
-          }
-
-          // TODO:  set removed tz abbrev on transit_platform_info for arrival.
-
-          // Get the block Id
-          block_id = transit_departure->blockid();
-        }
-      } else {
-        // No departing trip, set the arrival time (for next stop) to empty
-        // and set block Id to 0
-        arrival_time = "";
-        block_id = 0;
-
-        // Set assumed schedule if requested
-        if (controller.attributes.at(kNodeTransitPlatformInfoAssumedSchedule) && assumed_schedule) {
-          transit_platform_info->set_assumed_schedule(true);
-        }
-        assumed_schedule = false;
-      }
-    }
+    // Add multi modal stuff
+    multimodal_builder.Build(trip_node, edge_itr->trip_id, node, startnode, directededge, edge,
+                             start_tile, graphtile, mode_costing, controller, graphreader);
 
     // Add edge to the trip node and set its attributes
     TripLeg_Edge* trip_edge =
-        AddTripEdge(controller, edge, trip_id, block_id, mode, travel_type, costing, directededge,
-                    node->drive_on_right(), trip_node, graphtile, graphreader, second_of_week,
-                    startnode.id(), node->named_intersection(), start_tile,
-                    edge_itr->has_time_restrictions);
-
-    // Get the shape and set shape indexes (directed edge forward flag
-    // determines whether shape is traversed forward or reverse).
-    auto edgeinfo = graphtile->edgeinfo(directededge->edgeinfo_offset());
-    uint32_t begin_index = (is_first_edge) ? 0 : trip_shape.size() - 1;
+        AddTripEdge(controller, edge, edge_itr->trip_id, multimodal_builder.block_id, mode,
+                    travel_type, costing, directededge, node->drive_on_right(), trip_node, graphtile,
+                    time_info.second_of_week, startnode.id(), node->named_intersection(), start_tile,
+                    edge_itr->restriction_index);
 
     // some information regarding shape/length trimming
-    auto is_last_edge = edge_itr == (path_end - 1);
-    float length_pct = (is_first_edge ? 1.f - start_pct : (is_last_edge ? end_pct : 1.f));
+    float trim_start_pct = is_first_edge ? start_pct : 0;
+    float trim_end_pct = is_last_edge ? end_pct : 1;
 
     // Process the shape for edges where a route discontinuity occurs
+    uint32_t begin_index = (is_first_edge) ? 0 : trip_shape.size() - 1;
+    auto edgeinfo = graphtile->edgeinfo(directededge->edgeinfo_offset());
     if (edge_trimming && !edge_trimming->empty() && edge_trimming->count(edge_index) > 0) {
       // Get edge shape and reverse it if directed edge is not forward.
       auto edge_shape = edgeinfo.shape();
@@ -1609,6 +1300,10 @@ void TripLegBuilder::Build(
         edge_begin_info.trim = true;
         edge_begin_info.distance_along = start_pct;
         edge_begin_info.vertex = start_vrt;
+      } // No trimming needed
+      else if (!edge_begin_info.trim) {
+        edge_begin_info.distance_along = 0;
+        edge_begin_info.vertex = edge_shape.front();
       }
 
       // Handle partial shape for last edge
@@ -1616,27 +1311,32 @@ void TripLegBuilder::Build(
         edge_end_info.trim = true;
         edge_end_info.distance_along = end_pct;
         edge_end_info.vertex = end_vrt;
+      } // No trimming needed
+      else if (!edge_end_info.trim) {
+        edge_end_info.distance_along = 1;
+        edge_end_info.vertex = edge_shape.back();
       }
 
       // Overwrite the trimming information for the edge length now that we know what it is
-      length_pct = edge_end_info.distance_along - edge_begin_info.distance_along;
+      trim_start_pct = edge_begin_info.distance_along;
+      trim_end_pct = edge_end_info.distance_along;
 
       // Trim the shape
       auto edge_length = static_cast<float>(directededge->length());
       trim_shape(edge_begin_info.distance_along * edge_length, edge_begin_info.vertex,
                  edge_end_info.distance_along * edge_length, edge_end_info.vertex, edge_shape);
-      // Add edge shape to trip
-      trip_shape.insert(trip_shape.end(),
-                        (edge_shape.begin() + ((edge_begin_info.trim || is_first_edge) ? 0 : 1)),
+      // Add edge shape to the trip and skip the first point when its redundant with the previous edge
+      // TODO: uncommment correct removal of redundant shape after odin can handle uturns
+      // trip_shape.insert(trip_shape.end(), edge_shape.begin() + !is_first_edge, edge_shape.end());
+      trip_shape.insert(trip_shape.end(), edge_shape.begin() + !edge_begin_info.trim,
                         edge_shape.end());
 
-      // If edge_begin_info.exists and is not the first edge then increment begin_index since
+      // If edge_begin_info.trim and is not the first edge then increment begin_index since
       // the previous end shape index should not equal the current begin shape index because
       // of discontinuity
       if (edge_begin_info.trim && !is_first_edge) {
         ++begin_index;
       }
-
     } // We need to clip the shape if its at the beginning or end
     else if (is_first_edge || is_last_edge) {
       // Get edge shape and reverse it if directed edge is not forward.
@@ -1645,16 +1345,18 @@ void TripLegBuilder::Build(
         std::reverse(edge_shape.begin(), edge_shape.end());
       }
       float total = static_cast<float>(directededge->length());
-      // Note: that this cannot be both the first and last edge, that special case is handled above
-      // Trim the shape at the front for the first edge
-      if (is_first_edge) {
+      // Trim both ways
+      if (is_first_edge && is_last_edge) {
+        trim_shape(start_pct * total, start_vrt, end_pct * total, end_vrt, edge_shape);
+      } // Trim the shape at the front for the first edge
+      else if (is_first_edge) {
         trim_shape(start_pct * total, start_vrt, total, edge_shape.back(), edge_shape);
       } // And at the back if its the last edge
       else {
         trim_shape(0, edge_shape.front(), end_pct * total, end_vrt, edge_shape);
       }
       // Keep the shape
-      trip_shape.insert(trip_shape.end(), edge_shape.begin() + is_last_edge, edge_shape.end());
+      trip_shape.insert(trip_shape.end(), edge_shape.begin() + !is_first_edge, edge_shape.end());
     } // Just get the shape in there in the right direction no clipping needed
     else {
       if (directededge->forward()) {
@@ -1664,11 +1366,31 @@ void TripLegBuilder::Build(
       }
     }
 
+    // Set the portion of the edge we used
+    // TODO: attributes controller and then use this in recosting
+    trip_edge->set_source_along_edge(trim_start_pct);
+    trip_edge->set_target_along_edge(trim_end_pct);
+
     // Set length if requested. Convert to km
     if (controller.attributes.at(kEdgeLength)) {
-      float km = std::max(directededge->length() * kKmPerMeter * length_pct, 0.001f);
-      trip_edge->set_length(km);
+      float km =
+          std::max(directededge->length() * kKmPerMeter * (trim_end_pct - trim_start_pct), 0.001f);
+      trip_edge->set_length_km(km);
     }
+
+    // How long on this edge?
+    auto edge_seconds = edge_itr->elapsed_cost.secs - edge_itr->transition_cost.secs;
+    if (edge_itr != path_begin)
+      edge_seconds -= std::prev(edge_itr)->elapsed_cost.secs;
+
+    // Set shape attributes, sending incidents enables them in the pbf
+    auto incidents = controller.attributes.at(kIncidents)
+                         ? graphreader.GetIncidents(edge_itr->edgeid, graphtile)
+                         : valhalla::baldr::IncidentResult{};
+
+    SetShapeAttributes(controller, graphtile, directededge, trip_shape, begin_index, trip_path,
+                       trim_start_pct, trim_end_pct, edge_seconds,
+                       costing->flow_mask() & kCurrentFlowMask, incidents);
 
     // Set begin shape index if requested
     if (controller.attributes.at(kEdgeBeginShapeIndex)) {
@@ -1680,84 +1402,25 @@ void TripLegBuilder::Build(
       trip_edge->set_end_shape_index(trip_shape.size() - 1);
     }
 
-    // Set shape attributes
-    SetShapeAttributes(controller, graphtile, directededge, costing, trip_shape.begin() + begin_index,
-                       trip_shape.end(), trip_path, second_of_week, length_pct);
-
     // Set begin and end heading if requested. Uses trip_shape so
     // must be done after the edge's shape has been added.
     SetHeadings(trip_edge, controller, directededge, trip_shape, begin_index);
 
-    // Add connected edges from the start node. Do this after the first trip
-    // edge is added
-    //
-    // Our path is from 1 to 2 to 3 (nodes) to ... n nodes.
-    // Each letter represents the edge info.
-    // So at node 2, we will store the edge info for D and we will store the
-    // intersecting edge info for B, C, E, F, and G.  We need to make sure
-    // that we don't store the edge info from A and D again.
-    //
-    //     (X)    (3)   (X)
-    //       \\   ||   //
-    //      C \\ D|| E//
-    //         \\ || //
-    //      B   \\||//   F
-    // (X)======= (2) ======(X)
-    //            ||\\
-    //          A || \\ G
-    //            ||  \\
-    //            (1)  (X)
-    if (startnode.Is_Valid()) {
-      // Iterate through edges on this level to find any intersecting edges
-      // Follow any upwards or downward transitions
-      const DirectedEdge* de = start_tile->directededge(node->edge_index());
-      for (uint32_t idx1 = 0; idx1 < node->edge_count(); ++idx1, de++) {
-
-        // Skip shortcut edges AND the opposing edge of the previous edge in the path AND
-        // the current edge in the path AND the superceded edge of the current edge in the path
-        // if the current edge in the path is a shortcut
-        if (de->is_shortcut() || de->localedgeidx() == prior_opp_local_index ||
-            de->localedgeidx() == directededge->localedgeidx() ||
-            (directededge->is_shortcut() && directededge->shortcut() & de->superseded())) {
-          continue;
-        }
-
-        // Add intersecting edges on the same hierarchy level and not on the path
-        AddTripIntersectingEdge(controller, directededge, prev_de, de->localedgeidx(), node,
-                                trip_node, de);
-      }
-
-      // Add intersecting edges on different levels (follow NodeTransitions)
-      if (node->transition_count() > 0) {
-        const NodeTransition* trans = start_tile->transition(node->transition_index());
-        for (uint32_t i = 0; i < node->transition_count(); ++i, ++trans) {
-          // Get the end node tile and its directed edges
-          GraphId endnode = trans->endnode();
-          const GraphTile* endtile = graphreader.GetGraphTile(endnode);
-          if (endtile == nullptr) {
-            continue;
-          }
-          const NodeInfo* nodeinfo2 = endtile->node(endnode);
-          const DirectedEdge* de2 = endtile->directededge(nodeinfo2->edge_index());
-          for (uint32_t idx2 = 0; idx2 < nodeinfo2->edge_count(); ++idx2, de2++) {
-            // Skip shortcut edges and edges on the path
-            if (de2->is_shortcut() || de2->localedgeidx() == prior_opp_local_index ||
-                de2->localedgeidx() == directededge->localedgeidx()) {
-              continue;
-            }
-            AddTripIntersectingEdge(controller, directededge, prev_de, de2->localedgeidx(), nodeinfo2,
-                                    trip_node, de2);
-          }
-        }
-      }
+    // Add the intersecting edges at the node. Skip it if the node was an inner node (excluding start
+    // node and end node) of a shortcut that was recovered.
+    if (startnode.Is_Valid() && !edge_itr->start_node_is_recovered) {
+      AddIntersectingEdges(controller, start_tile, node, directededge, prev_de, prior_opp_local_index,
+                           graphreader, trip_node);
     }
+
+    ////////////// Prepare for the next iteration
 
     // Set the endnode of this directed edge as the startnode of the next edge.
     startnode = directededge->endnode();
 
+    // Save the opposing edge as the previous DirectedEdge (for name consistency)
     if (!directededge->IsTransitLine()) {
-      // Save the opposing edge as the previous DirectedEdge (for name consistency)
-      const GraphTile* t2 =
+      graph_tile_ptr t2 =
           directededge->leaves_tile() ? graphreader.GetGraphTile(directededge->endnode()) : graphtile;
       if (t2 == nullptr) {
         continue;
@@ -1768,21 +1431,33 @@ void TripLegBuilder::Build(
 
     // Save the index of the opposing local directed edge at the end node
     prior_opp_local_index = directededge->opp_local_idx();
-
-    // set is_first edge to false
-    is_first_edge = false;
   }
 
   // Add the last node
   auto* node = trip_path.add_node();
-  if (controller.attributes.at(kNodeaAdminIndex)) {
-    auto* last_tile = graphreader.GetGraphTile(startnode);
+  if (controller.attributes.at(kNodeAdminIndex)) {
+    auto last_tile = graphreader.GetGraphTile(startnode);
     node->set_admin_index(
         GetAdminIndex(last_tile->admininfo(last_tile->node(startnode)->admin_index()), admin_info_map,
                       admin_info_list));
   }
   if (controller.attributes.at(kNodeElapsedTime)) {
-    node->set_elapsed_time(elapsedtime);
+    node->mutable_cost()->mutable_elapsed_cost()->set_seconds(std::prev(path_end)->elapsed_cost.secs);
+    node->mutable_cost()->mutable_elapsed_cost()->set_cost(std::prev(path_end)->elapsed_cost.cost);
+  }
+
+  if (controller.attributes.at(kNodeTransitionTime)) {
+    node->mutable_cost()->mutable_transition_cost()->set_seconds(0);
+    node->mutable_cost()->mutable_transition_cost()->set_cost(0);
+  }
+
+  if (controller.attributes.at(kShapeAttributesClosure)) {
+    // Set the end shape index if we're ending on a closure as the last index is
+    // not processed in SetShapeAttributes above
+    valhalla::TripLeg_Closure* closure = fetch_last_closure_annotation(trip_path);
+    if (closure && !closure->has_end_shape_index()) {
+      closure->set_end_shape_index(trip_shape.size() - 1);
+    }
   }
 
   // Assign the admins
@@ -1799,6 +1474,10 @@ void TripLegBuilder::Build(
   if (osmchangeset != 0 && controller.attributes.at(kOsmChangeset)) {
     trip_path.set_osm_changeset(osmchangeset);
   }
+
+  // Add that extra costing information if requested
+  AccumulateRecostingInfoForward(options, start_pct, end_pct, forward_time_info, invariant,
+                                 graphreader, trip_path);
 }
 
 } // namespace thor

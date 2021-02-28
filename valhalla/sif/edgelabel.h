@@ -26,22 +26,34 @@ public:
   /**
    * Default constructor.
    */
-  EdgeLabel() {
+  EdgeLabel()
+      : predecessor_(baldr::kInvalidLabel), path_distance_(0), restrictions_(0),
+        edgeid_(baldr::kInvalidGraphId), opp_index_(0), opp_local_idx_(0), mode_(0),
+        endnode_(baldr::kInvalidGraphId), use_(0), classification_(0), shortcut_(0), dest_only_(0),
+        origin_(0), toll_(0), not_thru_(0), deadend_(0), on_complex_rest_(0), closure_pruning_(0),
+        has_measured_speed_(0), path_id_(0), restriction_idx_(0), cost_(0, 0), sortcost_(0),
+        distance_(0), transition_cost_(0, 0) {
+    assert(path_id_ <= baldr::kMaxMultiPathId);
   }
 
   /**
    * Constructor with values.
-   * @param predecessor   Index into the edge label list for the predecessor
-   *                      directed edge in the shortest path.
-   * @param edgeid        Directed edge Id.
-   * @param edge          Directed edge.
-   * @param cost          True cost (cost and time in seconds) to the edge.
-   * @param sortcost      Cost for sorting (includes A* heuristic)
-   * @param dist          Distance to the destination (meters)
-   * @param mode          Mode of travel along this edge.
-   * @param path_distance Accumulated path distance
-   * @param transition_cost Transition cost
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor         Index into the edge label list for the predecessor
+   *                            directed edge in the shortest path.
+   * @param edgeid              Directed edge Id.
+   * @param edge                Directed edge.
+   * @param cost                True cost (cost and time in seconds) to the edge.
+   * @param sortcost            Cost for sorting (includes A* heuristic)
+   * @param dist                Distance to the destination (meters)
+   * @param mode                Mode of travel along this edge.
+   * @param path_distance       Accumulated path distance
+   * @param transition_cost     Transition cost
+   * @param restriction_idx     If this label has restrictions, the index where the restriction is
+   * found
+   * @param closure_pruning     Should closure pruning be enabled on this path?
+   * @param has_measured_speed  Do we have any of the measured speed types set?
+   * @param path_id             When searching more than one path at a time this denotes which path
+   * the this label is tracking
    */
   EdgeLabel(const uint32_t predecessor,
             const baldr::GraphId& edgeid,
@@ -52,17 +64,23 @@ public:
             const TravelMode mode,
             const uint32_t path_distance,
             const Cost& transition_cost,
-            bool has_time_restrictions = false)
+            const uint8_t restriction_idx,
+            const bool closure_pruning,
+            const bool has_measured_speed,
+            const uint8_t path_id = 0)
       : predecessor_(predecessor), path_distance_(path_distance), restrictions_(edge->restrictions()),
         edgeid_(edgeid), opp_index_(edge->opp_index()), opp_local_idx_(edge->opp_local_idx()),
         mode_(static_cast<uint32_t>(mode)), endnode_(edge->endnode()),
-        has_time_restrictions_(has_time_restrictions), use_(static_cast<uint32_t>(edge->use())),
+        use_(static_cast<uint32_t>(edge->use())),
         classification_(static_cast<uint32_t>(edge->classification())), shortcut_(edge->shortcut()),
         dest_only_(edge->destonly()), origin_(0), toll_(edge->toll()), not_thru_(edge->not_thru()),
         deadend_(edge->deadend()),
         on_complex_rest_(edge->part_of_complex_restriction() || edge->start_restriction() ||
                          edge->end_restriction()),
-        cost_(cost), sortcost_(sortcost), distance_(dist), transition_cost_(transition_cost) {
+        closure_pruning_(closure_pruning), has_measured_speed_(has_measured_speed), path_id_(path_id),
+        restriction_idx_(restriction_idx), cost_(cost), sortcost_(sortcost), distance_(dist),
+        transition_cost_(transition_cost) {
+    assert(path_id_ <= baldr::kMaxMultiPathId);
   }
 
   /**
@@ -72,18 +90,18 @@ public:
    * @param cost        True cost (and elapsed time in seconds) to the edge.
    * @param sortcost    Cost for sorting (includes A* heuristic).
    * @param transition_cost Transition cost
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param restriction_idx Does the edge have time dependent restrictions.
    */
   void Update(const uint32_t predecessor,
               const Cost& cost,
               const float sortcost,
               const Cost& transition_cost,
-              const bool has_time_restrictions) {
+              const uint8_t restriction_idx) {
     predecessor_ = predecessor;
     cost_ = cost;
     sortcost_ = sortcost;
     transition_cost_ = transition_cost;
-    has_time_restrictions_ = has_time_restrictions;
+    restriction_idx_ = restriction_idx;
   }
 
   /**
@@ -91,25 +109,25 @@ public:
    * Update transit information: prior stop Id will stay the same but trip Id
    * and block Id may change (a new trip at an earlier departure time).
    * The mode, edge Id, and end node remain the same.
-   * @param predecessor    Predecessor directed edge in the shortest path.
-   * @param cost           True cost (and elapsed time in seconds) to the edge.
-   * @param sortcost       Cost for sorting (includes A* heuristic).
-   * @param path_distance  Accumulated path distance.
-   * @param transition_cost Transition cost
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor      Predecessor directed edge in the shortest path.
+   * @param cost             True cost (and elapsed time in seconds) to the edge.
+   * @param sortcost         Cost for sorting (includes A* heuristic).
+   * @param path_distance    Accumulated path distance.
+   * @param transition_cost  Transition cost
+   * @param restriction_idx  If this label has restrictions, the index where the restriction is found
    */
   void Update(const uint32_t predecessor,
               const Cost& cost,
               const float sortcost,
               const uint32_t path_distance,
               const Cost& transition_cost,
-              const bool has_time_restrictions) {
+              const uint8_t restriction_idx) {
     predecessor_ = predecessor;
     cost_ = cost;
     sortcost_ = sortcost;
     path_distance_ = path_distance;
     transition_cost_ = transition_cost;
-    has_time_restrictions_ = has_time_restrictions;
+    restriction_idx_ = restriction_idx;
   }
 
   /**
@@ -248,18 +266,11 @@ public:
     origin_ = true;
   }
   /**
-   * Does this edge have any time restrictions?
+   * Get the restriction idx, 255 means no restriction
    */
-  bool has_time_restriction() const {
-    return has_time_restrictions_;
+  uint8_t restriction_idx() const {
+    return restriction_idx_;
   }
-  /**
-   * Sets whether this edge has any time restrictions or not
-   */
-  void set_has_time_restriction(bool has_time_restrictions) {
-    has_time_restrictions_ = has_time_restrictions;
-  }
-
   /**
    * Does this edge have a toll?
    * @return  Returns true if this edge has a toll.
@@ -328,23 +339,38 @@ public:
   }
 
   /**
-   * Get the transition cost in seconds. This is used in the bidirectional A*
+   * Get the transition cost. This is used in the bidirectional A*
    * to determine the cost at the connection. But is also used for general stats
-   * @return  Returns the transition cost (including penalties) in seconds.
+   * @return  Returns the transition cost (including penalties).
    */
-  float transition_cost() const {
-    return transition_cost_.cost;
+  sif::Cost transition_cost() const {
+    return transition_cost_;
   }
 
   /**
-   * Get the transition cost in seconds. This is used in the bidirectional A*
-   * reverse path search to allow the recovery of the true elapsed time along
-   * the path. This is needed since the transition cost is applied at a
-   * different node than the forward search.
-   * @return  Returns the transition cost (without penalties) in seconds.
+   * Returns the location/path id (index) of the path that this label is tracking. Useful when your
+   * algorithm tracks multiple path expansions at the same time
+   *
+   * @return  the id of the path that this label is tracking
    */
-  float transition_secs() const {
-    return transition_cost_.secs;
+  uint8_t path_id() const {
+    return path_id_;
+  }
+
+  /**
+   * Should closure pruning be enabled on this path?
+   * @return Returns true if closure pruning should be enabled.
+   */
+  bool closure_pruning() const {
+    return closure_pruning_;
+  }
+
+  /**
+   * Do we have any of the measured speed types set?
+   * @return Returns true if we have any of the measured speed types set.
+   */
+  bool has_measured_speed() const {
+    return has_measured_speed_;
   }
 
 protected:
@@ -360,7 +386,7 @@ protected:
   uint32_t restrictions_ : 7;
 
   /**
-   * edgeid_:         Graph Id of the edge.
+   * edgeid_:        Graph Id of the edge.
    * opp_index_:     Index at the end node of the opposing directed edge.
    * opp_local_idx_: Index at the end node of the opposing local edge. This
    *                 value can be compared to the directed edge local_edge_idx
@@ -373,22 +399,22 @@ protected:
   uint64_t mode_ : 4;
 
   /**
-   * endnode_:        GraphId of the end node of the edge. This allows the
-   *                  expansion to occur by reading the node and not having
-   *                  to re-read the directed edge.
-   * use_:            Use of the prior edge.
-   * classification_: Road classification
-   * shortcut_:       Was the prior edge a shortcut edge?
-   * dest_only_:      Was the prior edge destination only?
-   * origin_:         True if this is an origin edge.
-   * toll_"           Edge is toll.
-   * not_thru_:       Flag indicating edge is not_thru.
-   * deadend_:        Flag indicating edge is a dead-end.
-   * on_complex_rest: Part of a complex restriction.
+   * endnode_:            GraphId of the end node of the edge. This allows the
+   *                      expansion to occur by reading the node and not having
+   *                      to re-read the directed edge.
+   * use_:                Use of the prior edge.
+   * classification_:     Road classification
+   * shortcut_:           Was the prior edge a shortcut edge?
+   * dest_only_:          Was the prior edge destination only?
+   * origin_:             True if this is an origin edge.
+   * toll_:               Edge is toll.
+   * not_thru_:           Flag indicating edge is not_thru.
+   * deadend_:            Flag indicating edge is a dead-end.
+   * on_complex_rest:     Part of a complex restriction.
+   * closure_pruning_:    Was closure pruning active on prior edge?
+   * has_measured_speed:  Do we have any of the measured speed types set?
    */
   uint64_t endnode_ : 46;
-  uint64_t spare_ : 1; // Unused  bit
-  uint64_t has_time_restrictions_ : 1;
   uint64_t use_ : 6;
   uint64_t classification_ : 3;
   uint64_t shortcut_ : 1;
@@ -398,6 +424,14 @@ protected:
   uint64_t not_thru_ : 1;
   uint64_t deadend_ : 1;
   uint64_t on_complex_rest_ : 1;
+  uint64_t closure_pruning_ : 1;
+  uint64_t has_measured_speed_ : 1;
+
+  // path id can be used to track more than one path at the same time in the same labelset
+  // its limited to 7 bits because edgestatus only had 7 and matching made sense to reduce confusion
+  uint32_t path_id_ : 7;
+  uint32_t restriction_idx_ : 8;
+  uint32_t spare_1 : 17;
 
   Cost cost_;      // Cost and elapsed time along the path.
   float sortcost_; // Sort cost - includes A* heuristic.
@@ -405,7 +439,7 @@ protected:
 
   // Was originally used for reverse search path to remove extra time where paths intersected
   // but its now used everywhere to measure the difference in time along the edge vs at the node
-  sif::Cost transition_cost_;
+  Cost transition_cost_;
 };
 
 /**
@@ -421,18 +455,23 @@ public:
 
   /**
    * Constructor with values.
-   * @param predecessor  Index into the edge label list for the predecessor
-   *                     directed edge in the shortest path.
-   * @param edgeid       Directed edge Id.
-   * @param oppedgeid    Opposing directed edge Id.
-   * @param edge         Directed edge.
-   * @param cost         True cost (cost and time in seconds) to the edge.
-   * @param sortcost     Cost for sorting (includes A* heuristic)n
-   * @param dist         Distance to the destination in meters.
-   * @param mode         Mode of travel along this edge.
-   * @param tc           Transition cost entering this edge.
-   * @param not_thru_pruning  Is not thru pruning enabled.
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor         Index into the edge label list for the predecessor
+   *                            directed edge in the shortest path.
+   * @param edgeid              Directed edge Id.
+   * @param oppedgeid           Opposing directed edge Id.
+   * @param edge                Directed edge.
+   * @param cost                True cost (cost and time in seconds) to the edge.
+   * @param sortcost            Cost for sorting (includes A* heuristic)n
+   * @param dist                Distance to the destination in meters.
+   * @param mode                Mode of travel along this edge.
+   * @param tc                  Transition cost entering this edge.
+   * @param not_thru_pruning    Is not thru pruning enabled.
+   * @param closure_pruning     Is closure pruning active.
+   * @param has_measured_speed  Do we have any of the measured speed types set?
+   * @param restriction_idx     If this label has restrictions, the index where the restriction is
+   * found
+   * @param path_id             When searching more than one path at a time this denotes which path
+   * the this label is tracking
    */
   BDEdgeLabel(const uint32_t predecessor,
               const baldr::GraphId& edgeid,
@@ -444,7 +483,10 @@ public:
               const sif::TravelMode mode,
               const sif::Cost& transition_cost,
               const bool not_thru_pruning,
-              const bool has_time_restrictions)
+              const bool closure_pruning,
+              const bool has_measured_speed,
+              const uint8_t restriction_idx,
+              const uint8_t path_id = 0)
       : EdgeLabel(predecessor,
                   edgeid,
                   edge,
@@ -454,24 +496,32 @@ public:
                   mode,
                   0,
                   transition_cost,
-                  has_time_restrictions),
+                  restriction_idx,
+                  closure_pruning,
+                  has_measured_speed,
+                  path_id),
         opp_edgeid_(oppedgeid), not_thru_pruning_(not_thru_pruning) {
   }
 
   /**
    * Constructor with values. Sets sortcost to the true cost.
    * Used with CostMatrix (no heuristic/distance to destination).
-   * @param predecessor  Index into the edge label list for the predecessor
-   *                       directed edge in the shortest path.
-   * @param edgeid        Directed edge.
-   * @param oppedgeid     Opposing directed edge Id.
-   * @param edge          End node of the directed edge.
-   * @param cost          True cost (cost and time in seconds) to the edge.
-   * @param mode          Mode of travel along this edge.
-   * @param tc            Transition cost entering this edge.
-   * @param path_distance Accumulated path distance.
-   * @param not_thru_pruning  Is not thru pruning enabled.
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor         Index into the edge label list for the predecessor
+   *                            directed edge in the shortest path.
+   * @param edgeid              Directed edge.
+   * @param oppedgeid           Opposing directed edge Id.
+   * @param edge                End node of the directed edge.
+   * @param cost                True cost (cost and time in seconds) to the edge.
+   * @param mode                Mode of travel along this edge.
+   * @param tc                  Transition cost entering this edge.
+   * @param path_distance       Accumulated path distance.
+   * @param not_thru_pruning    Is not thru pruning enabled.
+   * @param closure_pruning     Is closure pruning active.
+   * @param has_measured_speed  Do we have any of the measured speed types set?
+   * @param restriction_idx     If this label has restrictions, the index where the restriction is
+   * found
+   * @param path_id             When searching more than one path at a time this denotes which path
+   * the this label is tracking
    */
   BDEdgeLabel(const uint32_t predecessor,
               const baldr::GraphId& edgeid,
@@ -482,7 +532,10 @@ public:
               const sif::Cost& transition_cost,
               const uint32_t path_distance,
               const bool not_thru_pruning,
-              const bool has_time_restrictions)
+              const bool closure_pruning,
+              const bool has_measured_speed,
+              const uint8_t restriction_idx,
+              const uint8_t path_id = 0)
       : EdgeLabel(predecessor,
                   edgeid,
                   edge,
@@ -492,21 +545,29 @@ public:
                   mode,
                   path_distance,
                   transition_cost,
-                  has_time_restrictions),
+                  restriction_idx,
+                  closure_pruning,
+                  has_measured_speed,
+                  path_id),
         opp_edgeid_(oppedgeid), not_thru_pruning_(not_thru_pruning) {
   }
 
   /**
    * Constructor with values. Used in SetOrigin.
-   * @param predecessor  Index into the edge label list for the predecessor
-   *                     directed edge in the shortest path.
-   * @param edgeid       Directed edge Id.
-   * @param edge         Directed edge.
-   * @param cost         True cost (cost and time in seconds) to the edge.
-   * @param sortcost     Cost for sorting (includes A* heuristic).
-   * @param dist         Distance to the destination in meters.
-   * @param mode         Mode of travel along this edge.
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor         Index into the edge label list for the predecessor
+   *                            directed edge in the shortest path.
+   * @param edgeid              Directed edge Id.
+   * @param edge                Directed edge.
+   * @param cost                True cost (cost and time in seconds) to the edge.
+   * @param sortcost            Cost for sorting (includes A* heuristic).
+   * @param dist                Distance to the destination in meters.
+   * @param mode                Mode of travel along this edge.
+   * @param restriction_idx     If this label has restrictions, the index where the restriction is
+   * found
+   * @param closure_pruning     Is closure pruning active.
+   * @param has_measured_speed  Do we have any of the measured speed types set?
+   * @param path_id             When searching more than one path at a time this denotes which path
+   * the this label is tracking
    */
   BDEdgeLabel(const uint32_t predecessor,
               const baldr::GraphId& edgeid,
@@ -515,7 +576,10 @@ public:
               const float sortcost,
               const float dist,
               const sif::TravelMode mode,
-              const bool has_time_restrictions)
+              const uint8_t restriction_idx,
+              const bool closure_pruning,
+              const bool has_measured_speed,
+              const uint8_t path_id = 0)
       : EdgeLabel(predecessor,
                   edgeid,
                   edge,
@@ -525,7 +589,10 @@ public:
                   mode,
                   0,
                   Cost{},
-                  has_time_restrictions),
+                  restriction_idx,
+                  closure_pruning,
+                  has_measured_speed,
+                  path_id),
         not_thru_pruning_(!edge->not_thru()) {
     opp_edgeid_ = {};
   }
@@ -533,46 +600,46 @@ public:
   /**
    * Update an existing edge label with new predecessor and cost information.
    * The mode, edge Id, and end node remain the same.
-   * @param predecessor Predecessor directed edge in the shortest path.
-   * @param cost        True cost (and elapsed time in seconds) to the edge.
-   * @param sortcost    Cost for sorting (includes A* heuristic).
-   * @param tc          Transition cost onto the edge.
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor      Predecessor directed edge in the shortest path.
+   * @param cost             True cost (and elapsed time in seconds) to the edge.
+   * @param sortcost         Cost for sorting (includes A* heuristic).
+   * @param tc               Transition cost onto the edge.
+   * @param restriction_idx  If this label has restrictions, the index where the restriction is found
    */
   void Update(const uint32_t predecessor,
               const sif::Cost& cost,
               const float sortcost,
               const sif::Cost& tc,
-              const bool has_time_restrictions) {
+              const uint8_t restriction_idx) {
     predecessor_ = predecessor;
     cost_ = cost;
     sortcost_ = sortcost;
     transition_cost_ = tc;
-    has_time_restrictions_ = has_time_restrictions;
+    restriction_idx_ = restriction_idx;
   }
 
   /**
    * Update an existing edge label with new predecessor and cost information.
    * Update distance as well (used in time distance matrix)
-   * @param predecessor   Predecessor directed edge in the shortest path.
-   * @param cost          True cost (and elapsed time in seconds) to the edge.
-   * @param sortcost      Cost for sorting (includes A* heuristic).
-   * @param tc            Transition cost onto the edge.
-   * @param path_distance  Accumulated path distance.
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor      Predecessor directed edge in the shortest path.
+   * @param cost             True cost (and elapsed time in seconds) to the edge.
+   * @param sortcost         Cost for sorting (includes A* heuristic).
+   * @param tc               Transition cost onto the edge.
+   * @param path_distance    Accumulated path distance.
+   * @param restriction_idx  If this label has restrictions, the index where the restriction is found
    */
   void Update(const uint32_t predecessor,
               const sif::Cost& cost,
               const float sortcost,
               const sif::Cost& tc,
               const uint32_t path_distance,
-              const bool has_time_restrictions) {
+              const uint8_t restriction_idx) {
     predecessor_ = predecessor;
     cost_ = cost;
     sortcost_ = sortcost;
     transition_cost_ = tc;
     path_distance_ = path_distance;
-    has_time_restrictions_ = has_time_restrictions;
+    restriction_idx_ = restriction_idx;
   }
 
   /**
@@ -595,6 +662,8 @@ protected:
   // Graph Id of the opposing edge.
   // not_thru_pruning_: Is not thru pruning enabled?
   uint64_t opp_edgeid_ : 63; // Could be 46 (to provide more spare)
+  // TODO: Move not_thru_prunin to the base class - EdgeLabel so that we can
+  // consolidate all pruning related properties at 1 place
   uint64_t not_thru_pruning_ : 1;
 };
 
@@ -603,24 +672,30 @@ protected:
  */
 class MMEdgeLabel : public EdgeLabel {
 public:
+  // Default constructor
+  MMEdgeLabel() {
+  }
+
   /**
    * Constructor with values.  Used for multi-modal path.
-   * @param predecessor   Index into the edge label list for the predecessor
-   *                      directed edge in the shortest path.
-   * @param edgeid        Directed edge.
-   * @param edge          End node of the directed edge.
-   * @param cost          True cost (cost and time in seconds) to the edge.
-   * @param sortcost      Cost for sorting (includes A* heuristic)
-   * @param dist          Distance meters to the destination
-   * @param mode          Mode of travel along this edge.
-   * @param path_distance Accumulated distance.
-   * @param tripid        Trip Id for a transit edge.
-   * @param prior_stopid  Prior transit stop Id.
-   * @param blockid       Transit trip block Id.
+   * @param predecessor      Index into the edge label list for the predecessor
+   *                         directed edge in the shortest path.
+   * @param edgeid           Directed edge.
+   * @param edge             End node of the directed edge.
+   * @param cost             True cost (cost and time in seconds) to the edge.
+   * @param sortcost         Cost for sorting (includes A* heuristic)
+   * @param dist             Distance meters to the destination
+   * @param mode             Mode of travel along this edge.
+   * @param path_distance    Accumulated distance.
+   * @param tripid           Trip Id for a transit edge.
+   * @param prior_stopid     Prior transit stop Id.
+   * @param blockid          Transit trip block Id.
    * @param transit_operator Transit operator - index into an internal map
-   * @param has_transit   Does the path to this edge have any transit.
-   * @param transition_cost Transition cost
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param has_transit      Does the path to this edge have any transit.
+   * @param transition_cost  Transition cost
+   * @param restriction_idx  If this label has restrictions, the index where the restriction is found
+   * @param path_id          When searching more than one path at a time this denotes which path the
+   *                         this label is tracking
    */
   MMEdgeLabel(const uint32_t predecessor,
               const baldr::GraphId& edgeid,
@@ -636,7 +711,8 @@ public:
               const uint32_t transit_operator,
               const bool has_transit,
               const Cost& transition_cost,
-              const bool has_time_restrictions = false)
+              const uint8_t restriction_idx,
+              const uint8_t path_id = 0)
       : EdgeLabel(predecessor,
                   edgeid,
                   edge,
@@ -646,7 +722,10 @@ public:
                   mode,
                   path_distance,
                   transition_cost,
-                  has_time_restrictions),
+                  restriction_idx,
+                  true,
+                  false,
+                  path_id),
         prior_stopid_(prior_stopid), tripid_(tripid), blockid_(blockid),
         transit_operator_(transit_operator), has_transit_(has_transit) {
   }
@@ -656,14 +735,14 @@ public:
    * Update transit information: prior stop Id will stay the same but trip Id
    * and block Id may change (a new trip at an earlier departure time).
    * The mode, edge Id, and end node remain the same.
-   * @param predecessor    Predecessor directed edge in the shortest path.
-   * @param cost           True cost (and elapsed time in seconds) to the edge.
-   * @param sortcost       Cost for sorting (includes A* heuristic).
-   * @param path_distance  Accumulated path distance.
-   * @param tripid         Trip Id for a transit edge.
-   * @param blockid        Transit trip block Id.
-   * @param transition_cost Transition cost
-   * @param has_time_restrictions Does the edge have time dependent restrictions.
+   * @param predecessor      Predecessor directed edge in the shortest path.
+   * @param cost             True cost (and elapsed time in seconds) to the edge.
+   * @param sortcost         Cost for sorting (includes A* heuristic).
+   * @param path_distance    Accumulated path distance.
+   * @param tripid           Trip Id for a transit edge.
+   * @param blockid          Transit trip block Id.
+   * @param transition_cost  Transition cost
+   * @param restriction_idx  If this label has restrictions, the index where the restriction is found
    */
   void Update(const uint32_t predecessor,
               const sif::Cost& cost,
@@ -672,7 +751,7 @@ public:
               const uint32_t tripid,
               const uint32_t blockid,
               const Cost& transition_cost,
-              const bool has_time_restrictions) {
+              const uint8_t restriction_idx) {
     predecessor_ = predecessor;
     cost_ = cost;
     sortcost_ = sortcost;
@@ -680,7 +759,7 @@ public:
     tripid_ = tripid;
     blockid_ = blockid;
     transition_cost_ = transition_cost;
-    has_time_restrictions_ = has_time_restrictions;
+    restriction_idx_ = restriction_idx;
   }
 
   /**

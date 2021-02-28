@@ -16,13 +16,14 @@ add_dependencies(benchmarks utrecht_tiles)
 # Macro for defining Google Benchmark microbenchmark targets
 macro (add_valhalla_benchmark target_file)
   set(target_name benchmark-${target_file})
-  add_executable(${target_name} ${target_file}.cc)
+  add_executable(${target_name}
+    ${target_file}.cc)
   set_target_properties(${target_name} PROPERTIES FOLDER "Benchmarks")
   set_target_properties(${target_name}
     PROPERTIES
     COMPILE_DEFINITIONS
     VALHALLA_SOURCE_DIR="${VALHALLA_SOURCE_DIR}/")
-  target_link_libraries(${target_name} valhalla benchmark::benchmark)
+  target_link_libraries(${target_name} valhalla_test benchmark::benchmark)
   add_dependencies(benchmarks ${target_name})
   add_dependencies(${target_name} utrecht_tiles)
   # Add a custom target running the benchmark
@@ -32,6 +33,7 @@ macro (add_valhalla_benchmark target_file)
     COMMENT "Running ${target_name} in ${CMAKE_CURRENT_BINARY_DIR}"
     DEPENDS ${target_name})
   set_target_properties(run-${target_name} PROPERTIES FOLDER "Benchmarks")
+  add_dependencies(run-${target_name} utrecht_tiles)
   add_dependencies(run-benchmarks run-${target_name})
 endmacro()
 

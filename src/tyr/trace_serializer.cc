@@ -3,6 +3,7 @@
 #include "baldr/graphconstants.h"
 #include "baldr/json.h"
 #include "odin/enhancedtrippath.h"
+#include "proto_conversions.h"
 #include "thor/attributes_controller.h"
 #include "tyr/serializers.h"
 
@@ -186,8 +187,8 @@ json::ArrayPtr serialize_edges(const AttributesController& controller,
       if (edge.has_speed()) {
         edge_map->emplace("speed", static_cast<uint64_t>(std::round(edge.speed() * scale)));
       }
-      if (edge.has_length()) {
-        edge_map->emplace("length", json::fp_t{edge.length() * scale, 3});
+      if (edge.has_length_km()) {
+        edge_map->emplace("length", json::fp_t{edge.length_km() * scale, 3});
       }
       // TODO: do we want to output 'is_route_number'?
       if (edge.name_size() > 0) {
@@ -292,8 +293,9 @@ json::ArrayPtr serialize_edges(const AttributesController& controller,
           end_node_map->emplace("intersecting_edges", intersecting_edge_array);
         }
 
-        if (node.has_elapsed_time()) {
-          end_node_map->emplace("elapsed_time", json::fp_t{node.elapsed_time(), 3});
+        if (node.has_cost() && node.cost().has_elapsed_cost() &&
+            node.cost().elapsed_cost().has_seconds()) {
+          end_node_map->emplace("elapsed_time", json::fp_t{node.cost().elapsed_cost().seconds(), 3});
         }
         if (node.has_admin_index()) {
           end_node_map->emplace("admin_index", static_cast<uint64_t>(node.admin_index()));
@@ -307,8 +309,10 @@ json::ArrayPtr serialize_edges(const AttributesController& controller,
         if (node.has_time_zone()) {
           end_node_map->emplace("time_zone", node.time_zone());
         }
-        if (node.has_transition_time()) {
-          end_node_map->emplace("transition_time", json::fp_t{node.transition_time(), 3});
+        if (node.has_cost() && node.cost().has_transition_cost() &&
+            node.cost().transition_cost().has_seconds()) {
+          end_node_map->emplace("transition_time",
+                                json::fp_t{node.cost().transition_cost().seconds(), 3});
         }
 
         // TODO transit info at node

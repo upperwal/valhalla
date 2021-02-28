@@ -127,19 +127,19 @@ void DirectionsBuilder::UpdateHeading(EnhancedTripLeg* etp) {
       min_edge_length = kMinPedestrianBicycleEdgeLength;
     }
 
-    if (curr_edge && (curr_edge->length() < min_edge_length)) {
+    if (curr_edge && (curr_edge->length_km() < min_edge_length)) {
 
       // Set the current begin heading
-      if (prev_edge && (prev_edge->length() >= min_edge_length)) {
+      if (prev_edge && (prev_edge->length_km() >= min_edge_length)) {
         curr_edge->set_begin_heading(prev_edge->end_heading());
-      } else if (next_edge && (next_edge->length() >= min_edge_length)) {
+      } else if (next_edge && (next_edge->length_km() >= min_edge_length)) {
         curr_edge->set_begin_heading(next_edge->begin_heading());
       }
 
       // Set the current end heading
-      if (next_edge && (next_edge->length() >= min_edge_length)) {
+      if (next_edge && (next_edge->length_km() >= min_edge_length)) {
         curr_edge->set_end_heading(next_edge->begin_heading());
-      } else if (prev_edge && (prev_edge->length() >= min_edge_length)) {
+      } else if (prev_edge && (prev_edge->length_km() >= min_edge_length)) {
         curr_edge->set_end_heading(prev_edge->end_heading());
       }
     }
@@ -373,6 +373,9 @@ void DirectionsBuilder::PopulateDirectionsLeg(const Options& options,
     // Travel mode
     trip_maneuver->set_travel_mode(translate_travel_mode.find(maneuver.travel_mode())->second);
 
+    // Bss maneuver type
+    trip_maneuver->set_bss_maneuver_type(maneuver.bss_maneuver_type());
+
     // Travel type
     switch (maneuver.travel_mode()) {
       case TripLeg_TravelMode_kDrive: {
@@ -397,7 +400,8 @@ void DirectionsBuilder::PopulateDirectionsLeg(const Options& options,
 
   // Populate summary
   trip_directions.mutable_summary()->set_length(etp->GetLength(options.units()));
-  trip_directions.mutable_summary()->set_time(etp->node(etp->GetLastNodeIndex()).elapsed_time());
+  trip_directions.mutable_summary()->set_time(
+      etp->node(etp->GetLastNodeIndex()).cost().elapsed_cost().seconds());
   auto mutable_bbox = trip_directions.mutable_summary()->mutable_bbox();
   mutable_bbox->mutable_min_ll()->set_lat(etp->bbox().min_ll().lat());
   mutable_bbox->mutable_min_ll()->set_lng(etp->bbox().min_ll().lng());

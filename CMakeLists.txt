@@ -14,6 +14,7 @@ include(FindPkgConfig)
 include(GNUInstallDirs)
 
 set(VALHALLA_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(VALHALLA_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR})
 list(INSERT CMAKE_MODULE_PATH 0 ${VALHALLA_SOURCE_DIR}/cmake)
 
 set(CMAKE_CXX_STANDARD 14 CACHE STRING "C++ language version to use (default is 14)")
@@ -22,14 +23,17 @@ option(ENABLE_DATA_TOOLS "Enable Valhalla data tools" ON)
 option(ENABLE_SERVICES "Enable Valhalla services" ON)
 option(ENABLE_HTTP "Enable the use of CURL" ON)
 option(ENABLE_PYTHON_BINDINGS "Enable Python bindings" ON)
-option(ENABLE_NODE_BINDINGS "Build NodeJs bindings" ON)
 option(ENABLE_CCACHE "Speed up incremental rebuilds via ccache" ON)
 option(ENABLE_COVERAGE "Build with coverage instrumentalisation" OFF)
 option(ENABLE_COMPILER_WARNINGS "Build with compiler warnings" OFF)
-option(ENABLE_SANITIZER "Use memory sanitizer for Debug build" OFF)
+option(ENABLE_SANITIZERS "Use all the integrated sanitizers for Debug build" OFF)
+option(ENABLE_ADDRESS_SANITIZER "Use memory sanitizer for Debug build" OFF)
+option(ENABLE_UNDEFINED_SANITIZER "Use UB sanitizer for Debug build" OFF)
 option(ENABLE_TESTS "Enable Valhalla tests" ON)
 option(ENABLE_WERROR "Convert compiler warnings to errors. Requires ENABLE_COMPILER_WARNINGS=ON to take effect" OFF)
 option(ENABLE_BENCHMARKS "Enable microbenchmarking" ON)
+option(ENABLE_THREAD_SAFE_TILE_REF_COUNT "If ON tiles reference counters are thread safe" OFF)
+
 set(LOGGING_LEVEL "" CACHE STRING "Logging level, default is INFO")
 set_property(CACHE LOGGING_LEVEL PROPERTY STRINGS "NONE;ALL;ERROR;WARN;INFO;DEBUG;TRACE")
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
@@ -98,25 +102,18 @@ if(ENABLE_CCACHE AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILE
   endif()
 endif()
 
-if(ENABLE_SANITIZER)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
-  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
-endif()
+include(cmake/SanitizerOptions.cmake)
 
 ## Coverage report targets
 if(ENABLE_COVERAGE)
-  find_program(LCOV_PATH NAMES lcov lcov.bat lcov.exe lcov.perl)
   find_program(GENHTML_PATH NAMES genhtml genhtml.perl genhtml.bat)
-  if(NOT LCOV_PATH OR NOT GENHTML_PATH)
-    message(FATAL_ERROR "no lcov or genhtml installed")
+  if(NOT GENHTML_PATH)
+    message(FATAL_ERROR "no genhtml installed")
   endif()
 
+  set(FASTCOV_PATH ${VALHALLA_SOURCE_DIR}/third_party/fastcov/fastcov.py)
   add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/coverage.info
-    COMMAND ${LCOV_PATH} --directory . --base-directory ${VALHALLA_SOURCE_DIR} --no-external --capture --output-file coverage.info --no-checksum
-    COMMAND ${LCOV_PATH} --remove coverage.info '*/third_party/*' --output-file coverage.info
-    COMMAND ${LCOV_PATH} --remove coverage.info '${CMAKE_CURRENT_BINARY_DIR}/*' --output-file coverage.info
-    COMMAND ${LCOV_PATH} --list coverage.info
+    COMMAND ${FASTCOV_PATH} -d . --exclude /usr/ third_party/ ${CMAKE_CURRENT_BINARY_DIR}/ --lcov -o coverage.info
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     DEPENDS check)
 
@@ -138,11 +135,12 @@ if(NOT TARGET CURL::CURL)
       find_package(CURL REQUIRED)
     endif()
     set_target_properties(CURL::CURL PROPERTIES
-      #INTERFACE_LINK_LIBRARIES "${CURL_LIBRARIES}"
       INTERFACE_INCLUDE_DIRECTORIES "${CURL_INCLUDE_DIR}"
       INTERFACE_COMPILE_DEFINITIONS CURL_STATICLIB)
-    if(NOT WIN32)
+    if(NOT MSVC)
       set_property(TARGET CURL::CURL APPEND PROPERTY INTERFACE_LINK_LIBRARIES "${CURL_LIBRARIES}")
+    else()
+      link_libraries(${CURL_LIBRARIES})
     endif()
   endif()
 else()
@@ -232,6 +230,10 @@ elseif(NOT Boost_FOUND)
 endif()
 add_definitions(-DBOOST_NO_CXX11_SCOPED_ENUMS)
 
+if (ENABLE_THREAD_SAFE_TILE_REF_COUNT)
+ add_definitions(-DENABLE_THREAD_SAFE_TILE_REF_COUNT)
+endif ()
+
 ## libvalhalla
 add_subdirectory(src)
 
@@ -242,11 +244,6 @@ if(ENABLE_PYTHON_BINDINGS)
   install(FILES COPYING CHANGELOG.md
     DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/python-valhalla"
     COMPONENT python)
-endif()
-
-# NodeJS bindings
-if (ENABLE_NODE_BINDINGS)
-  add_subdirectory(src/bindings/node)
 endif()
 
 ## Executable targets
@@ -265,16 +262,15 @@ endfunction()
 ## Valhalla programs
 set(valhalla_programs valhalla_run_map_match valhalla_benchmark_loki valhalla_benchmark_skadi
   valhalla_run_isochrone valhalla_run_route valhalla_benchmark_adjacency_list valhalla_run_matrix
-  valhalla_path_comparison valhalla_export_edges valhalla_expand_bounding_box)
+  valhalla_path_comparison valhalla_export_edges valhalla_expand_bounding_box valhalla_service)
 
 ## Valhalla data tools
 set(valhalla_data_tools valhalla_build_statistics valhalla_ways_to_edges valhalla_validate_transit
-  valhalla_benchmark_admins	valhalla_build_connectivity	valhalla_build_tiles
-  valhalla_build_admins valhalla_convert_transit valhalla_fetch_transit valhalla_query_transit
-  valhalla_add_predicted_traffic)
+  valhalla_benchmark_admins valhalla_build_connectivity	valhalla_build_tiles valhalla_build_admins
+  valhalla_convert_transit valhalla_fetch_transit valhalla_query_transit valhalla_add_predicted_traffic)
 
 ## Valhalla services
-set(valhalla_services	valhalla_service valhalla_loki_worker	valhalla_odin_worker valhalla_thor_worker)
+set(valhalla_services valhalla_loki_worker valhalla_odin_worker valhalla_thor_worker)
 
 if(ENABLE_TOOLS)
   foreach(program ${valhalla_programs})
@@ -283,7 +279,7 @@ if(ENABLE_TOOLS)
     set_target_properties(${program} PROPERTIES FOLDER "Tools")
     create_source_groups("Source Files" ${path})
     target_link_libraries(${program} Boost::program_options valhalla)
-    if(WIN32)
+    if(MSVC)
       target_link_libraries(${program} ${CURL_LIBRARIES})
     endif()
     install(TARGETS ${program} DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime)
@@ -301,7 +297,7 @@ if(ENABLE_DATA_TOOLS)
       # Using LuaJIT on macOS requires a couple of extra linker flags
       target_link_options(${program} PUBLIC -pagezero_size 10000 -image_base 100000000)
     endif()
-    if(WIN32)
+    if(MSVC)
       target_link_libraries(${program} ${CURL_LIBRARIES})
     endif()
     install(TARGETS ${program} DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime)
@@ -348,7 +344,7 @@ if(ENABLE_TESTS)
 endif()
 
 # NOTE(mookerji): Windows CI seems to break on the gbench build, so shelve Win32 support for now.
-if(ENABLE_BENCHMARKS AND NOT WIN32)
+if(ENABLE_BENCHMARKS AND ENABLE_DATA_TOOLS AND NOT WIN32)
   add_subdirectory(bench)
 endif()
 

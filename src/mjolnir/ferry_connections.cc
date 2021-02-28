@@ -49,7 +49,7 @@ uint32_t ShortestPath(const uint32_t start_node_idx,
     std::list<PointLL> shape;
     for (size_t i = 0; i < count; ++i) {
       auto node = (*way_nodes[idx++]).node;
-      shape.emplace_back(node.lng_, node.lat_);
+      shape.emplace_back(node.latlng());
     }
     return shape;
   };
@@ -218,11 +218,11 @@ bool ShortFerry(const uint32_t node_index,
     std::list<PointLL> shape;
     for (size_t i = 0; i < count; ++i) {
       auto node = (*way_nodes[idx++]).node;
-      shape.emplace_back(node.lng_, node.lat_);
+      shape.emplace_back(node.latlng());
     }
     return shape;
   };
-  uint32_t wayid = 0;
+  uint64_t wayid = 0;
   bool short_edge = false;
   for (const auto& edge : bundle.node_edges) {
     // Check ferry edge. If the end node has a non-ferry edge check
@@ -256,8 +256,7 @@ void ReclassifyFerryConnections(const std::string& ways_file,
                                 const std::string& way_nodes_file,
                                 const std::string& nodes_file,
                                 const std::string& edges_file,
-                                const uint32_t rc,
-                                DataQuality& stats) {
+                                const uint32_t rc) {
   LOG_INFO("Reclassifying ferry connection graph edges...");
 
   sequence<OSMWay> ways(ways_file, false);

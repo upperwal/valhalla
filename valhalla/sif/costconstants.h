@@ -63,7 +63,7 @@ enum class BicycleType : uint8_t {
  */
 struct AvoidEdge {
   baldr::GraphId id;
-  float percent_along;
+  double percent_along;
 };
 
 /**
@@ -73,6 +73,9 @@ struct AvoidEdge {
 struct Cost {
   float cost;
   float secs;
+  // TODO:
+  // float dist;
+  // float consumption;
 
   /**
    * Default constructor

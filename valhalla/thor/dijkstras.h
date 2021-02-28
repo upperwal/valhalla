@@ -22,10 +22,10 @@
 namespace valhalla {
 namespace thor {
 
-enum class InfoRoutingType {
-  forward,
-  bidirectional,
-  multi_modal,
+enum class ExpansionType {
+  forward = 0,
+  reverse = 1,
+  multimodal = 2,
 };
 
 enum class ExpansionRecommendation {
@@ -39,7 +39,16 @@ enum class ExpansionRecommendation {
  */
 class Dijkstras {
 public:
-  Dijkstras();
+  /**
+   * Constructor.
+   * @param max_reserved_labels_count maximum capacity of edgelabels container
+   *                                  that allowed to keep reserved
+   */
+  explicit Dijkstras(uint32_t max_reserved_labels_count = std::numeric_limits<uint32_t>::max());
+
+  Dijkstras(const Dijkstras&) = delete;
+  Dijkstras& operator=(const Dijkstras&) = delete;
+
   virtual ~Dijkstras() {
   }
 
@@ -49,6 +58,21 @@ public:
   virtual void Clear();
 
   /**
+   * Compute the best first graph traversal from a list locations
+   * @param expansion_type  What type of expansion should be run
+   * @param  locations      List of locations from which to expand.
+   * @param  reader         provides access to underlying graph primitives
+   * @param  costings       List of costing objects
+   * @param  mode           Travel mode
+   */
+  void Expand(ExpansionType expansion_type,
+              valhalla::Api& api,
+              baldr::GraphReader& reader,
+              const sif::mode_costing_t& costings,
+              const sif::TravelMode mode);
+
+protected:
+  /**
    * Compute the best first graph traversal from a list of origin locations
    * @param  origin_locs  List of origin locations.
    * @param  graphreader  Graphreader
@@ -57,7 +81,7 @@ public:
    */
   virtual void Compute(google::protobuf::RepeatedPtrField<valhalla::Location>& origin_locs,
                        baldr::GraphReader& graphreader,
-                       const std::shared_ptr<sif::DynamicCost>* mode_costing,
+                       const sif::mode_costing_t& mode_costing,
                        const sif::TravelMode mode);
 
   /**
@@ -69,7 +93,7 @@ public:
    */
   virtual void ComputeReverse(google::protobuf::RepeatedPtrField<valhalla::Location>& dest_locations,
                               baldr::GraphReader& graphreader,
-                              const std::shared_ptr<sif::DynamicCost>* mode_costing,
+                              const sif::mode_costing_t& mode_costing,
                               const sif::TravelMode mode);
 
   /**
@@ -82,21 +106,20 @@ public:
   virtual void
   ComputeMultiModal(google::protobuf::RepeatedPtrField<valhalla::Location>& origin_locations,
                     baldr::GraphReader& graphreader,
-                    const std::shared_ptr<sif::DynamicCost>* mode_costing,
+                    const sif::mode_costing_t& mode_costing,
                     const sif::TravelMode mode);
 
-protected:
   // A child-class must implement this to learn about what nodes were expanded
-  virtual void ExpandingNode(baldr::GraphReader& graphreader,
-                             const baldr::GraphTile* tile,
-                             const baldr::NodeInfo* node,
-                             const sif::EdgeLabel& current,
-                             const sif::EdgeLabel* previous){};
+  virtual void ExpandingNode(baldr::GraphReader&,
+                             graph_tile_ptr,
+                             const baldr::NodeInfo*,
+                             const sif::EdgeLabel&,
+                             const sif::EdgeLabel*) = 0;
 
   // A child-class must implement this to decide when to stop the expansion
   virtual ExpansionRecommendation ShouldExpand(baldr::GraphReader& graphreader,
                                                const sif::EdgeLabel& pred,
-                                               const InfoRoutingType route_type) = 0;
+                                               const ExpansionType route_type) = 0;
 
   // A child-class must implement this to tell the algorithm how much expansion to expect to do
   virtual void GetExpansionHints(uint32_t& bucket_count, uint32_t& edge_label_reservation) const = 0;
@@ -122,15 +145,23 @@ protected:
   // Vector of edge labels (requires access by index).
   std::vector<sif::BDEdgeLabel> bdedgelabels_;
   std::vector<sif::MMEdgeLabel> mmedgelabels_;
+  uint32_t max_reserved_labels_count_;
 
   // Adjacency list - approximate double bucket sort
-  std::shared_ptr<baldr::DoubleBucketQueue> adjacencylist_;
+  baldr::DoubleBucketQueue<sif::BDEdgeLabel> adjacencylist_;
+  baldr::DoubleBucketQueue<sif::MMEdgeLabel> mmadjacencylist_;
 
   // Edge status. Mark edges that are in adjacency list or settled.
   EdgeStatus edgestatus_;
 
   // when doing timezone differencing a timezone cache speeds up the computation
   baldr::DateTime::tz_sys_info_cache_t tz_cache_;
+
+  // when expanding should we treat each location as its own individual path to track concurrently but
+  // separately from the other paths
+  bool multipath_;
+
+  // TODO: add an interrupt here so that the caller can abort the main loop externally
 
   /**
    * Initialization prior to computing the graph expansion
@@ -139,7 +170,9 @@ protected:
    * @param bucketsize  Adjacency list bucket size.
    */
   template <typename label_container_t>
-  void Initialize(label_container_t& labels, const uint32_t bucketsize);
+  void Initialize(label_container_t& labels,
+                  baldr::DoubleBucketQueue<typename label_container_t::value_type>& queue,
+                  const uint32_t bucketsize);
 
   /**
    * Sets the start time for forward expansion or end time for reverse expansion based on the
@@ -205,7 +238,7 @@ protected:
                                const bool from_transition,
                                const std::shared_ptr<sif::DynamicCost>& pc,
                                const std::shared_ptr<sif::DynamicCost>& tc,
-                               const std::shared_ptr<sif::DynamicCost>* mode_costing,
+                               const sif::mode_costing_t& mode_costing,
                                const baldr::TimeInfo& time_info);
 
   /**
@@ -246,7 +279,7 @@ protected:
    * @return Returns the timezone index. A value of 0 indicates an invalid timezone.
    */
   int GetTimezone(baldr::GraphReader& graphreader, const baldr::GraphId& node) {
-    const baldr::GraphTile* tile = graphreader.GetGraphTile(node);
+    graph_tile_ptr tile = graphreader.GetGraphTile(node);
     return (tile == nullptr) ? 0 : tile->node(node)->timezone();
   }
 };

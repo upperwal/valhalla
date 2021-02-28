@@ -17,7 +17,7 @@ public:
   /**
    * Constructor.
    */
-  AStarHeuristic() : costfactor_(1.0f), distapprox_({}) {
+  AStarHeuristic() : distapprox_({}), costfactor_(1.0f) {
   }
 
   /**
@@ -78,9 +78,9 @@ public:
   }
 
 private:
-  midgard::DistanceApproximator distapprox_; // Distance approximation
-  float costfactor_;                         // Cost factor - ensures the cost estimate
-                                             // underestimates the true cost.
+  midgard::DistanceApproximator<midgard::PointLL> distapprox_; // Distance approximation
+  float costfactor_; // Cost factor - ensures the cost estimate
+                     // underestimates the true cost.
 };
 
 } // namespace thor

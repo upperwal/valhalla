@@ -9,14 +9,19 @@
 #include "midgard/pointll.h"
 #include "midgard/polyline2.h"
 #include "midgard/util.h"
-
 #include "odin/enhancedtrippath.h"
 #include "odin/util.h"
+#include "tyr/serializer_constants.h"
 #include "tyr/serializers.h"
+#include "worker.h"
 
 #include "proto/directions.pb.h"
 #include "proto/options.pb.h"
 #include "proto/trip.pb.h"
+#include "proto_conversions.h"
+#ifdef INLINE_TEST
+#include "test.h"
+#endif
 
 using namespace valhalla;
 using namespace valhalla::midgard;
@@ -28,6 +33,10 @@ using namespace std;
 namespace {
 const std::string kSignElementDelimiter = ", ";
 const std::string kDestinationsDelimiter = ": ";
+const std::string kSpeedLimitSignVienna = "vienna";
+const std::string kSpeedLimitSignMutcd = "mutcd";
+const std::string kSpeedLimitUnitsKph = "km/h";
+const std::string kSpeedLimitUnitsMph = "mph";
 
 constexpr std::size_t MAX_USED_SEGMENTS = 2;
 struct NamedSegment {
@@ -36,7 +45,6 @@ struct NamedSegment {
   float distance;
 };
 
-constexpr const double COORDINATE_PRECISION = 1e6;
 struct Coordinate {
   std::int32_t lng;
   std::int32_t lat;
@@ -47,13 +55,13 @@ struct Coordinate {
 
 inline std::int32_t toFixed(const float floating) {
   const auto d = static_cast<double>(floating);
-  const auto fixed = static_cast<std::int32_t>(std::round(d * COORDINATE_PRECISION));
+  const auto fixed = static_cast<std::int32_t>(std::round(d * ENCODE_PRECISION));
   return fixed;
 }
 
 inline double toFloating(const std::int32_t fixed) {
   const auto i = static_cast<std::int32_t>(fixed);
-  const auto floating = static_cast<double>(i) / COORDINATE_PRECISION;
+  const auto floating = static_cast<double>(i) * DECODE_PRECISION;
   return floating;
 }
 
@@ -68,7 +76,7 @@ const constexpr double DEGREE_TO_RAD = 0.017453292519943295769236907684886;
 const constexpr double RAD_TO_DEGREE = 1. / DEGREE_TO_RAD;
 const constexpr double EPSG3857_MAX_LATITUDE = 85.051128779806592378; // 90(4*atan(exp(pi))/pi-1)
 
-const constexpr float DOUGLAS_PEUCKER_THRESHOLDS[19] = {
+const constexpr PointLL::first_type DOUGLAS_PEUCKER_THRESHOLDS[19] = {
     703125.0, // z0
     351562.5, // z1
     175781.2, // z2
@@ -130,6 +138,86 @@ inline unsigned getFittedZoom(Coordinate south_west, Coordinate north_east) {
     return MIN_ZOOM;
 }
 
+// For transforming ISO 3166-1 country codes from alpha2 to alpha3
+std::unordered_map<std::string, std::string> iso2_to_iso3 =
+    {{"AD", "AND"}, {"AE", "ARE"}, {"AF", "AFG"}, {"AG", "ATG"}, {"AI", "AIA"}, {"AL", "ALB"},
+     {"AM", "ARM"}, {"AO", "AGO"}, {"AQ", "ATA"}, {"AR", "ARG"}, {"AS", "ASM"}, {"AT", "AUT"},
+     {"AU", "AUS"}, {"AW", "ABW"}, {"AX", "ALA"}, {"AZ", "AZE"}, {"BA", "BIH"}, {"BB", "BRB"},
+     {"BD", "BGD"}, {"BE", "BEL"}, {"BF", "BFA"}, {"BG", "BGR"}, {"BH", "BHR"}, {"BI", "BDI"},
+     {"BJ", "BEN"}, {"BL", "BLM"}, {"BM", "BMU"}, {"BN", "BRN"}, {"BO", "BOL"}, {"BQ", "BES"},
+     {"BR", "BRA"}, {"BS", "BHS"}, {"BT", "BTN"}, {"BV", "BVT"}, {"BW", "BWA"}, {"BY", "BLR"},
+     {"BZ", "BLZ"}, {"CA", "CAN"}, {"CC", "CCK"}, {"CD", "COD"}, {"CF", "CAF"}, {"CG", "COG"},
+     {"CH", "CHE"}, {"CI", "CIV"}, {"CK", "COK"}, {"CL", "CHL"}, {"CM", "CMR"}, {"CN", "CHN"},
+     {"CO", "COL"}, {"CR", "CRI"}, {"CU", "CUB"}, {"CV", "CPV"}, {"CW", "CUW"}, {"CX", "CXR"},
+     {"CY", "CYP"}, {"CZ", "CZE"}, {"DE", "DEU"}, {"DJ", "DJI"}, {"DK", "DNK"}, {"DM", "DMA"},
+     {"DO", "DOM"}, {"DZ", "DZA"}, {"EC", "ECU"}, {"EE", "EST"}, {"EG", "EGY"}, {"EH", "ESH"},
+     {"ER", "ERI"}, {"ES", "ESP"}, {"ET", "ETH"}, {"FI", "FIN"}, {"FJ", "FJI"}, {"FK", "FLK"},
+     {"FM", "FSM"}, {"FO", "FRO"}, {"FR", "FRA"}, {"GA", "GAB"}, {"GB", "GBR"}, {"GD", "GRD"},
+     {"GE", "GEO"}, {"GF", "GUF"}, {"GG", "GGY"}, {"GH", "GHA"}, {"GI", "GIB"}, {"GL", "GRL"},
+     {"GM", "GMB"}, {"GN", "GIN"}, {"GP", "GLP"}, {"GQ", "GNQ"}, {"GR", "GRC"}, {"GS", "SGS"},
+     {"GT", "GTM"}, {"GU", "GUM"}, {"GW", "GNB"}, {"GY", "GUY"}, {"HK", "HKG"}, {"HM", "HMD"},
+     {"HN", "HND"}, {"HR", "HRV"}, {"HT", "HTI"}, {"HU", "HUN"}, {"ID", "IDN"}, {"IE", "IRL"},
+     {"IL", "ISR"}, {"IM", "IMN"}, {"IN", "IND"}, {"IO", "IOT"}, {"IQ", "IRQ"}, {"IR", "IRN"},
+     {"IS", "ISL"}, {"IT", "ITA"}, {"JE", "JEY"}, {"JM", "JAM"}, {"JO", "JOR"}, {"JP", "JPN"},
+     {"KE", "KEN"}, {"KG", "KGZ"}, {"KH", "KHM"}, {"KI", "KIR"}, {"KM", "COM"}, {"KN", "KNA"},
+     {"KP", "PRK"}, {"KR", "KOR"}, {"XK", "XKX"}, {"KW", "KWT"}, {"KY", "CYM"}, {"KZ", "KAZ"},
+     {"LA", "LAO"}, {"LB", "LBN"}, {"LC", "LCA"}, {"LI", "LIE"}, {"LK", "LKA"}, {"LR", "LBR"},
+     {"LS", "LSO"}, {"LT", "LTU"}, {"LU", "LUX"}, {"LV", "LVA"}, {"LY", "LBY"}, {"MA", "MAR"},
+     {"MC", "MCO"}, {"MD", "MDA"}, {"ME", "MNE"}, {"MF", "MAF"}, {"MG", "MDG"}, {"MH", "MHL"},
+     {"MK", "MKD"}, {"ML", "MLI"}, {"MM", "MMR"}, {"MN", "MNG"}, {"MO", "MAC"}, {"MP", "MNP"},
+     {"MQ", "MTQ"}, {"MR", "MRT"}, {"MS", "MSR"}, {"MT", "MLT"}, {"MU", "MUS"}, {"MV", "MDV"},
+     {"MW", "MWI"}, {"MX", "MEX"}, {"MY", "MYS"}, {"MZ", "MOZ"}, {"NA", "NAM"}, {"NC", "NCL"},
+     {"NE", "NER"}, {"NF", "NFK"}, {"NG", "NGA"}, {"NI", "NIC"}, {"NL", "NLD"}, {"NO", "NOR"},
+     {"NP", "NPL"}, {"NR", "NRU"}, {"NU", "NIU"}, {"NZ", "NZL"}, {"OM", "OMN"}, {"PA", "PAN"},
+     {"PE", "PER"}, {"PF", "PYF"}, {"PG", "PNG"}, {"PH", "PHL"}, {"PK", "PAK"}, {"PL", "POL"},
+     {"PM", "SPM"}, {"PN", "PCN"}, {"PR", "PRI"}, {"PS", "PSE"}, {"PT", "PRT"}, {"PW", "PLW"},
+     {"PY", "PRY"}, {"QA", "QAT"}, {"RE", "REU"}, {"RO", "ROU"}, {"RS", "SRB"}, {"RU", "RUS"},
+     {"RW", "RWA"}, {"SA", "SAU"}, {"SB", "SLB"}, {"SC", "SYC"}, {"SD", "SDN"}, {"SS", "SSD"},
+     {"SE", "SWE"}, {"SG", "SGP"}, {"SH", "SHN"}, {"SI", "SVN"}, {"SJ", "SJM"}, {"SK", "SVK"},
+     {"SL", "SLE"}, {"SM", "SMR"}, {"SN", "SEN"}, {"SO", "SOM"}, {"SR", "SUR"}, {"ST", "STP"},
+     {"SV", "SLV"}, {"SX", "SXM"}, {"SY", "SYR"}, {"SZ", "SWZ"}, {"TC", "TCA"}, {"TD", "TCD"},
+     {"TF", "ATF"}, {"TG", "TGO"}, {"TH", "THA"}, {"TJ", "TJK"}, {"TK", "TKL"}, {"TL", "TLS"},
+     {"TM", "TKM"}, {"TN", "TUN"}, {"TO", "TON"}, {"TR", "TUR"}, {"TT", "TTO"}, {"TV", "TUV"},
+     {"TW", "TWN"}, {"TZ", "TZA"}, {"UA", "UKR"}, {"UG", "UGA"}, {"UM", "UMI"}, {"US", "USA"},
+     {"UY", "URY"}, {"UZ", "UZB"}, {"VA", "VAT"}, {"VC", "VCT"}, {"VE", "VEN"}, {"VG", "VGB"},
+     {"VI", "VIR"}, {"VN", "VNM"}, {"VU", "VUT"}, {"WF", "WLF"}, {"WS", "WSM"}, {"YE", "YEM"},
+     {"YT", "MYT"}, {"ZA", "ZAF"}, {"ZM", "ZMB"}, {"ZW", "ZWE"}, {"CS", "SCG"}, {"AN", "ANT"}};
+
+// Sign style and unit conventions for speed limit signs by country.
+// Most countries use Vienna style and km/h, but the countries below
+// use MUTCD and/or mph conventions.
+std::unordered_map<std::string, std::pair<std::string, std::string>> speed_limit_info = {
+    {"AG", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"AI", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"AS", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"BS", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"BZ", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"CA", {kSpeedLimitSignMutcd, kSpeedLimitUnitsKph}},
+    {"DM", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"FK", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"GB", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"GD", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"GG", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"GS", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"GU", {kSpeedLimitSignMutcd, kSpeedLimitUnitsMph}},
+    {"IM", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"JE", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"KN", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"KY", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"LC", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"LR", {kSpeedLimitSignMutcd, kSpeedLimitUnitsKph}},
+    {"MP", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"MS", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"PR", {kSpeedLimitSignMutcd, kSpeedLimitUnitsMph}},
+    {"SH", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"TC", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"US", {kSpeedLimitSignMutcd, kSpeedLimitUnitsMph}},
+    {"VC", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"VG", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+    {"VI", {kSpeedLimitSignMutcd, kSpeedLimitUnitsMph}},
+    {"WS", {kSpeedLimitSignVienna, kSpeedLimitUnitsMph}},
+};
+
 namespace osrm_serializers {
 /*
 OSRM output is described in: http://project-osrm.org/docs/v5.5.1/api/
@@ -158,105 +246,29 @@ OSRM output is described in: http://project-osrm.org/docs/v5.5.1/api/
 }
 */
 
-/**********OLD OSRM CODE - delete
-    const std::unordered_map<int, std::string> maneuver_type = {
-        { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kNone),             "0"
-},//NoTurn = 0, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kContinue), "1"
-},//GoStraight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kBecomes), "1"
-},//GoStraight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kRampStraight), "1"
-},//GoStraight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kStayStraight), "1"
-},//GoStraight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kMerge), "1"
-},//GoStraight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kFerryEnter), "1"
-},//GoStraight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kFerryExit), "1"
-},//GoStraight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kSlightRight), "2"
-},//TurnSlightRight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kRight), "3"
-},//TurnRight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kRampRight), "3"
-},//TurnRight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kExitRight), "3"
-},//TurnRight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kStayRight), "3"
-},//TurnRight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kSharpRight), "4"
-},//TurnSharpRight, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kUturnLeft), "5"
-},//UTurn, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kUturnRight),       "5"
-},//UTurn, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kSharpLeft),        "6"
-},//TurnSharpLeft, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kLeft), "7"
-},//TurnLeft, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kRampLeft), "7"
-},//TurnLeft, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kExitLeft), "7"
-},//TurnLeft, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kStayLeft), "7"
-},//TurnLeft, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kSlightLeft), "8"
-},//TurnSlightLeft,
-        //{ static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_k),               "9"
-},//ReachViaLocation, {
-static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutEnter),  "11"
-},//EnterRoundAbout, {
-static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutExit),   "12"
-},//LeaveRoundAbout,
-        //{ static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_k),               "13"
-},//StayOnRoundAbout, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kStart), "14"
-},//StartAtEndOfStreet, {
-static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kStartRight),       "14"
-},//StartAtEndOfStreet, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kStartLeft),
-"14" },//StartAtEndOfStreet, {
-static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kDestination),      "15"
-},//ReachedYourDestination, {
-static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kDestinationRight), "15"
-},//ReachedYourDestination, {
-static_cast<int>(valhalla::DirectionsLeg_Maneuver_Type_kDestinationLeft),  "15"
-},//ReachedYourDestination,
-        //{ static_cast<int>valhalla::DirectionsLeg_Maneuver_Type_k),                "16"
-},//EnterAgainstAllowedDirection,
-        //{ static_cast<int>valhalla::DirectionsLeg_Maneuver_Type_k),                "17"
-},//LeaveAgainstAllowedDirection
-    };
-
-    const std::unordered_map<int, std::string> cardinal_direction_string = {
-      { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kNorth),     "N"
-}, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kNorthEast), "NE" },
-      { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kEast),      "E"
-}, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kSouthEast), "SE" },
-      { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kSouth),     "S"
-}, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kSouthWest), "SW" },
-      { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kWest),      "W"
-}, { static_cast<int>(valhalla::DirectionsLeg_Maneuver_CardinalDirection_kNorthWest), "NW" }
-    };
-
-    json::ArrayPtr route_instructions(const
-google::protobuf::RepeatedPtrField<valhalla::DirectionsLeg>& legs){ auto route_instructions =
-json::array({}); for(const auto& leg : legs) { for(const auto& maneuver : leg.maneuver()) {
-          //if we dont know the type of maneuver then skip it
-          auto maneuver_text = maneuver_type.find(static_cast<int>(maneuver.type()));
-          if(maneuver_text == maneuver_type.end())
-            continue;
-
-          //length
-          std::ostringstream length;
-          length << static_cast<uint64_t>(maneuver.length()*1000.f) << "m";
-
-          //json
-          route_instructions->emplace_back(json::array({
-            maneuver_text->second, //maneuver type
-            (maneuver.street_name_size() ? maneuver.street_name(0) : string("")), //street name
-            static_cast<uint64_t>(maneuver.length() * 1000.f), //length in meters
-            static_cast<uint64_t>(maneuver.begin_shape_index()), //index in the shape
-            static_cast<uint64_t>(maneuver.time()), //time in seconds
-            length.str(), //length as a string with a unit suffix
-            cardinal_direction_string.find(static_cast<int>(maneuver.begin_cardinal_direction()))->second,
-// one of: N S E W NW NE SW SE static_cast<uint64_t>(maneuver.begin_heading())
-          }));
-        }
-      }
-      return route_instructions;
-    }
-**/
-
 // Add OSRM route summary information: distance, duration
-void route_summary(json::MapPtr& route,
-                   const google::protobuf::RepeatedPtrField<valhalla::DirectionsLeg>& legs,
-                   bool imperial) {
+void route_summary(json::MapPtr& route, const valhalla::Api& api, bool imperial, int route_index) {
   // Compute total distance and duration
-  double duration = 0.0f;
-  double distance = 0.0f;
-  for (const auto& leg : legs) {
+  double duration = 0;
+  double distance = 0;
+  double weight = 0;
+  auto leg_itr = api.trip().routes(route_index).legs().begin();
+  std::vector<std::pair<double, double>> recosts(api.options().recostings_size(), {0, 0});
+  for (const auto& leg : api.directions().routes(route_index).legs()) {
     distance += leg.summary().length();
     duration += leg.summary().time();
+    weight += leg_itr->node().rbegin()->cost().elapsed_cost().cost();
+    for (int i = 0; i < leg_itr->node().rbegin()->recosts_size(); ++i) {
+      const auto& recost = leg_itr->node().rbegin()->recosts(i);
+      if (!recost.has_elapsed_cost() || recosts[i].first < 0) {
+        recosts[i].first = -1;
+        recosts[i].second = -1;
+      } else {
+        recosts[i].first += recost.elapsed_cost().seconds();
+        recosts[i].second += recost.elapsed_cost().cost();
+      }
+    }
+    ++leg_itr;
   }
 
   // Convert distance to meters. Output distance and duration.
@@ -264,34 +276,44 @@ void route_summary(json::MapPtr& route,
   route->emplace("distance", json::fp_t{distance, 3});
   route->emplace("duration", json::fp_t{duration, 3});
 
-  // TODO - support returning weight based on costing method
-  // as well as returning the costing method
-  float weight = duration;
   route->emplace("weight", json::fp_t{weight, 3});
-  route->emplace("weight_name", std::string("Valhalla default"));
+  assert(api.options().costing_options(api.options().costing()).has_name());
+  route->emplace("weight_name", api.options().costing_options(api.options().costing()).name());
+
+  auto recosting_itr = api.options().recostings().begin();
+  for (const auto& recost : recosts) {
+    if (recost.first < 0) {
+      route->emplace("duration_" + recosting_itr->name(), nullptr_t());
+      route->emplace("weight_" + recosting_itr->name(), nullptr_t());
+    } else {
+      route->emplace("duration_" + recosting_itr->name(), json::fp_t{recost.first, 3});
+      route->emplace("weight_" + recosting_itr->name(), json::fp_t{recost.second, 3});
+    }
+    ++recosting_itr;
+  }
 }
 
 // Generate leg shape in geojson format.
 json::MapPtr geojson_shape(const std::vector<PointLL> shape) {
   auto geojson = json::map({});
   auto coords = json::array({});
+  coords->reserve(shape.size());
   for (const auto& p : shape) {
-    coords->emplace_back(json::array({json::fp_t{p.lng(), 6}, json::fp_t{p.lat(), 6}}));
+    coords->emplace_back(
+        json::array({json::fp_t{p.lng(), DIGITS_PRECISION}, json::fp_t{p.lat(), DIGITS_PRECISION}}));
   }
   geojson->emplace("type", std::string("LineString"));
-  geojson->emplace("coordinates", coords);
+  geojson->emplace("coordinates", std::move(coords));
   return geojson;
 }
 
 // Generate full shape of the route.
-std::vector<PointLL>
-full_shape(const google::protobuf::RepeatedPtrField<valhalla::DirectionsLeg>& legs,
-           const valhalla::Options& options) {
+std::vector<PointLL> full_shape(const valhalla::DirectionsRoute& directions,
+                                const valhalla::Options& options) {
   // If just one leg and it we want polyline6 then we just return the encoded leg shape
-  if (legs.size() == 1 && options.shape_format() == polyline6) {
-    return midgard::decode<std::vector<PointLL>>(legs.begin()->shape());
+  if (directions.legs().size() == 1 && options.shape_format() == polyline6) {
+    return midgard::decode<std::vector<PointLL>>(directions.legs().begin()->shape());
   }
-
   // TODO: there is a tricky way to do this... since the end of each leg is the same as the
   // beginning we essentially could just peel off the first encoded shape point of all the legs (but
   // the first) this way we wouldn't really have to do any decoding (would be far faster). it might
@@ -299,7 +321,7 @@ full_shape(const google::protobuf::RepeatedPtrField<valhalla::DirectionsLeg>& le
   // great!) have to have a look should make this a function in midgard probably so the logic is all
   // in the same place
   std::vector<PointLL> decoded;
-  for (const auto& leg : legs) {
+  for (const auto& leg : directions.legs()) {
     auto decoded_leg = midgard::decode<std::vector<PointLL>>(leg.shape());
     decoded.insert(decoded.end(), decoded.size() ? decoded_leg.begin() + 1 : decoded_leg.begin(),
                    decoded_leg.end());
@@ -308,16 +330,12 @@ full_shape(const google::protobuf::RepeatedPtrField<valhalla::DirectionsLeg>& le
 }
 
 // Generate simplified shape of the route.
-std::vector<PointLL>
-simplified_shape(const google::protobuf::RepeatedPtrField<valhalla::DirectionsLeg>& legs,
-                 const valhalla::Options& options) {
+std::vector<PointLL> simplified_shape(const valhalla::DirectionsRoute& directions) {
   Coordinate south_west(std::numeric_limits<int>::max(), std::numeric_limits<int>::max());
   Coordinate north_east(std::numeric_limits<int>::min(), std::numeric_limits<int>::min());
-
   std::vector<PointLL> simple_shape;
   std::unordered_set<size_t> indices;
-
-  for (const auto& leg : legs) {
+  for (const auto& leg : directions.legs()) {
     auto decoded_leg = midgard::decode<std::vector<PointLL>>(leg.shape());
     for (const auto& coord : decoded_leg) {
       south_west.lng = std::min(south_west.lng, toFixed(coord.lng()));
@@ -342,24 +360,76 @@ simplified_shape(const google::protobuf::RepeatedPtrField<valhalla::DirectionsLe
 }
 
 void route_geometry(json::MapPtr& route,
-                    const google::protobuf::RepeatedPtrField<valhalla::DirectionsLeg>& legs,
+                    const valhalla::DirectionsRoute& directions,
                     const valhalla::Options& options) {
-  // full geom = !has_generalize()
-  // simplified geom = has_generalize && generalize == 0
-  // no geom = has_generalize && generalize == -1
   std::vector<PointLL> shape;
   if (options.has_generalize() && options.generalize() == 0.0f) {
-    shape = simplified_shape(legs, options);
+    shape = simplified_shape(directions);
   } else if (!options.has_generalize() || (options.has_generalize() && options.generalize() > 0.0f)) {
-    shape = full_shape(legs, options);
+    shape = full_shape(directions, options);
   }
-
   if (options.shape_format() == geojson) {
     route->emplace("geometry", geojson_shape(shape));
   } else {
     int precision = options.shape_format() == polyline6 ? 1e6 : 1e5;
     route->emplace("geometry", midgard::encode(shape, precision));
   }
+}
+
+json::MapPtr serialize_annotations(const valhalla::TripLeg& trip_leg) {
+  auto attributes_map = json::map({});
+  attributes_map->reserve(4);
+
+  if (trip_leg.shape_attributes().time_size() > 0) {
+    auto duration_array = json::array({});
+    duration_array->reserve(trip_leg.shape_attributes().time_size());
+    for (const auto& time : trip_leg.shape_attributes().time()) {
+      // milliseconds (ms) to seconds (sec)
+      duration_array->push_back(json::fp_t{time * kSecPerMillisecond, 3});
+    }
+    attributes_map->emplace("duration", duration_array);
+  }
+
+  if (trip_leg.shape_attributes().length_size() > 0) {
+    auto distance_array = json::array({});
+    distance_array->reserve(trip_leg.shape_attributes().length_size());
+    for (const auto& length : trip_leg.shape_attributes().length()) {
+      // decimeters (dm) to meters (m)
+      distance_array->push_back(json::fp_t{length * kMeterPerDecimeter, 1});
+    }
+    attributes_map->emplace("distance", distance_array);
+  }
+
+  if (trip_leg.shape_attributes().speed_size() > 0) {
+    auto speeds_array = json::array({});
+    speeds_array->reserve(trip_leg.shape_attributes().speed_size());
+    for (const auto& speed : trip_leg.shape_attributes().speed()) {
+      // dm/s to m/s
+      speeds_array->push_back(json::fp_t{speed * kMeterPerDecimeter, 1});
+    }
+    attributes_map->emplace("speed", speeds_array);
+  }
+
+  if (trip_leg.shape_attributes().speed_limit_size() > 0) {
+    auto speed_limits_array = json::array({});
+    speed_limits_array->reserve(trip_leg.shape_attributes().speed_limit_size());
+    for (const auto& speed_limit : trip_leg.shape_attributes().speed_limit()) {
+      auto speed_limit_annotation = json::map({});
+      if (speed_limit == kUnlimitedSpeedLimit) {
+        speed_limit_annotation->emplace("none", true);
+      } else if (speed_limit > 0) {
+        // TODO support mph?
+        speed_limit_annotation->emplace("unit", kSpeedLimitUnitsKph);
+        speed_limit_annotation->emplace("speed", static_cast<uint64_t>(speed_limit));
+      } else {
+        speed_limit_annotation->emplace("unknown", true);
+      }
+      speed_limits_array->push_back(speed_limit_annotation);
+    }
+    attributes_map->emplace("maxspeed", speed_limits_array);
+  }
+
+  return attributes_map;
 }
 
 // Serialize waypoints for optimized route. Note that OSRM retains the
@@ -414,6 +484,7 @@ json::ArrayPtr intersections(const valhalla::DirectionsLeg::Maneuver& maneuver,
   count = 0;
   auto intersections = json::array({});
   uint32_t n = arrive_maneuver ? maneuver.end_path_index() + 1 : maneuver.end_path_index();
+  EnhancedTripLeg_Node* prev_node = nullptr;
   for (uint32_t i = maneuver.begin_path_index(); i < n; i++) {
     auto intersection = json::map({});
 
@@ -432,21 +503,66 @@ json::ArrayPtr intersections(const valhalla::DirectionsLeg::Maneuver& maneuver,
     loc->emplace_back(json::fp_t{ll.lat(), 6});
     intersection->emplace("location", loc);
     intersection->emplace("geometry_index", static_cast<uint64_t>(shape_index));
-    if (node->has_transition_time())
-      intersection->emplace("duration", json::fp_t{node->transition_time(), 3});
+
+    // Add index into admin list
+    if (node->has_admin_index()) {
+      intersection->emplace("admin_index", static_cast<uint64_t>(node->admin_index()));
+    }
+
+    if (!arrive_maneuver) {
+      if (curr_edge->has_is_urban()) {
+        intersection->emplace("is_urban", curr_edge->is_urban());
+      }
+    }
+
+    auto toll_collection = json::map({});
+    if (node->type() == TripLeg_Node::kTollBooth) {
+      toll_collection->emplace("type", std::string("toll_booth"));
+    } else if (node->type() == TripLeg_Node::kTollGantry) {
+      toll_collection->emplace("type", std::string("toll_gantry"));
+    }
+    if (!toll_collection->empty())
+      intersection->emplace("toll_collection", toll_collection);
+
+    if (node->cost().transition_cost().seconds() > 0)
+      intersection->emplace("turn_duration", json::fp_t{node->cost().transition_cost().seconds(), 3});
+    if (node->cost().transition_cost().cost() > 0)
+      intersection->emplace("turn_weight", json::fp_t{node->cost().transition_cost().cost(), 3});
+    auto next_node = i + 1 < n ? etp->GetEnhancedNode(i + 1) : nullptr;
+    if (next_node) {
+      auto secs = next_node->cost().elapsed_cost().seconds() - node->cost().elapsed_cost().seconds();
+      auto cost = next_node->cost().elapsed_cost().cost() - node->cost().elapsed_cost().cost();
+      if (secs > 0)
+        intersection->emplace("duration", json::fp_t{secs, 3});
+      if (cost > 0)
+        intersection->emplace("weight", json::fp_t{cost, 3});
+    }
+
+    // TODO: add recosted durations to the intersection?
+
+    // Add rest_stop when passing by a rest_area or service_area
+    if (i > 0 && !arrive_maneuver) {
+      auto rest_stop = json::map({});
+      for (uint32_t m = 0; m < node->intersecting_edge_size(); m++) {
+        auto intersecting_edge = node->GetIntersectingEdge(m);
+        bool routeable = intersecting_edge->IsTraversableOutbound(curr_edge->travel_mode());
+
+        if (routeable && intersecting_edge->use() == TripLeg_Use_kRestAreaUse) {
+          rest_stop->emplace("type", std::string("rest_area"));
+          intersection->emplace("rest_stop", rest_stop);
+          break;
+        } else if (routeable && intersecting_edge->use() == TripLeg_Use_kServiceAreaUse) {
+          rest_stop->emplace("type", std::string("service_area"));
+          intersection->emplace("rest_stop", rest_stop);
+          break;
+        }
+      }
+    }
 
     // Get bearings and access to outgoing intersecting edges. Do not add
     // any intersecting edges for the first depart intersection and for
     // the arrive step.
     std::vector<IntersectionEdges> edges;
-    if (i > 0 && !arrive_maneuver) {
-      for (uint32_t m = 0; m < node->intersecting_edge_size(); m++) {
-        auto intersecting_edge = node->GetIntersectingEdge(m);
-        bool routeable = intersecting_edge->IsTraversableOutbound(curr_edge->travel_mode());
-        uint32_t bearing = static_cast<uint32_t>(intersecting_edge->begin_heading());
-        edges.emplace_back(bearing, routeable, false, false);
-      }
-    }
 
     // Add the edge departing the node
     if (!arrive_maneuver) {
@@ -491,6 +607,17 @@ json::ArrayPtr intersections(const valhalla::DirectionsLeg::Maneuver& maneuver,
     intersection->emplace("entry", entries);
     intersection->emplace("bearings", bearings);
 
+    // Add tunnel_name for tunnels
+    if (!arrive_maneuver) {
+      if (curr_edge->tunnel() && !curr_edge->tagged_name().empty()) {
+        for (uint32_t t = 0; t < curr_edge->tagged_name().size(); ++t) {
+          if (curr_edge->tagged_name().Get(t).type() == TaggedName_Type_kTunnel) {
+            intersection->emplace("tunnel_name", curr_edge->tagged_name().Get(t).value());
+          }
+        }
+      }
+    }
+
     // Add classes based on the first edge after the maneuver (not needed
     // for arrive maneuver).
     if (!arrive_maneuver) {
@@ -508,10 +635,9 @@ json::ArrayPtr intersections(const valhalla::DirectionsLeg::Maneuver& maneuver,
         classes.push_back("ferry");
       }
 
-      /** TODO
-      if ( ) {
+      if (curr_edge->destination_only()) {
         classes.push_back("restricted");
-      } */
+      }
       if (classes.size() > 0) {
         auto class_list = json::array({});
         for (const auto& cl : classes) {
@@ -529,51 +655,58 @@ json::ArrayPtr intersections(const valhalla::DirectionsLeg::Maneuver& maneuver,
       auto lanes = json::array({});
       for (const auto& turn_lane : prev_edge->turn_lanes()) {
         auto lane = json::map({});
-        // Process 'valid' flag
-        lane->emplace("valid", turn_lane.is_active());
+        // Process 'valid' & 'active' flags
+        bool is_active = turn_lane.state() == TurnLane::kActive;
+        // an active lane is also valid
+        bool is_valid = is_active || turn_lane.state() == TurnLane::kValid;
+        lane->emplace("active", is_active);
+        lane->emplace("valid", is_valid);
+        // Add valid_indication for a valid & active lanes
+        if (turn_lane.state() != TurnLane::kInvalid) {
+          lane->emplace("valid_indication", turn_lane_direction(turn_lane.active_direction()));
+        }
 
         // Process 'indications' array - add indications from left to right
         auto indications = json::array({});
         uint16_t mask = turn_lane.directions_mask();
 
         // TODO make map for lane mask to osrm indication string
+
         // reverse (left u-turn)
-        if ((mask & kTurnLaneReverse) &&
-            (maneuver.type() == DirectionsLeg_Maneuver_Type_kUturnLeft)) {
-          indications->emplace_back(std::string("uturn"));
+        if (mask & kTurnLaneReverse && prev_edge->drive_on_right()) {
+          indications->emplace_back(osrmconstants::kModifierUturn);
         }
         // sharp_left
         if (mask & kTurnLaneSharpLeft) {
-          indications->emplace_back(std::string("sharp left"));
+          indications->emplace_back(osrmconstants::kModifierSharpLeft);
         }
         // left
         if (mask & kTurnLaneLeft) {
-          indications->emplace_back(std::string("left"));
+          indications->emplace_back(osrmconstants::kModifierLeft);
         }
         // slight_left
         if (mask & kTurnLaneSlightLeft) {
-          indications->emplace_back(std::string("slight left"));
+          indications->emplace_back(osrmconstants::kModifierSlightLeft);
         }
         // through
         if (mask & kTurnLaneThrough) {
-          indications->emplace_back(std::string("straight"));
+          indications->emplace_back(osrmconstants::kModifierStraight);
         }
         // slight_right
         if (mask & kTurnLaneSlightRight) {
-          indications->emplace_back(std::string("slight right"));
+          indications->emplace_back(osrmconstants::kModifierSlightRight);
         }
         // right
         if (mask & kTurnLaneRight) {
-          indications->emplace_back(std::string("right"));
+          indications->emplace_back(osrmconstants::kModifierRight);
         }
         // sharp_right
         if (mask & kTurnLaneSharpRight) {
-          indications->emplace_back(std::string("sharp right"));
+          indications->emplace_back(osrmconstants::kModifierSharpRight);
         }
         // reverse (right u-turn)
-        if ((mask & kTurnLaneReverse) &&
-            (maneuver.type() == DirectionsLeg_Maneuver_Type_kUturnRight)) {
-          indications->emplace_back(std::string("uturn"));
+        if (mask & kTurnLaneReverse && !prev_edge->drive_on_right()) {
+          indications->emplace_back(osrmconstants::kModifierUturn);
         }
         lane->emplace("indications", std::move(indications));
         lanes->emplace_back(std::move(lane));
@@ -599,6 +732,60 @@ std::string exits(const valhalla::DirectionsLeg_Maneuver_Sign& sign) {
     exits += number.text();
   }
   return exits;
+}
+
+valhalla::baldr::json::RawJSON serializeIncident(const TripLeg::Incident& incident) {
+  rapidjson::StringBuffer stringbuffer;
+  rapidjson::Writer<rapidjson::StringBuffer> writer(stringbuffer);
+  writer.StartObject();
+  osrm::serializeIncidentProperties(writer, incident.metadata(),
+                                    incident.has_begin_shape_index() ? incident.begin_shape_index()
+                                                                     : -1,
+                                    incident.has_end_shape_index() ? incident.end_shape_index() : -1,
+                                    "", "");
+  writer.EndObject();
+  return {stringbuffer.GetString()};
+}
+
+// Serializes incidents and adds to json-document
+void serializeIncidents(const google::protobuf::RepeatedPtrField<TripLeg::Incident>& incidents,
+                        json::Jmap& doc) {
+  if (incidents.size() == 0) {
+    // No incidents, nothing to do
+    return;
+  }
+  json::ArrayPtr serialized_incidents = std::shared_ptr<json::Jarray>(new json::Jarray());
+  {
+    // Bring up any already existing array
+    auto existing = doc.find("incidents");
+    if (existing != doc.end()) {
+      if (auto* ptr = boost::get<std::shared_ptr<valhalla::baldr::json::Jarray>>(&existing->second)) {
+        serialized_incidents = *ptr;
+      } else {
+        throw std::logic_error("Invalid state: stored ptr should not be null");
+      }
+    }
+  }
+  for (const auto& incident : incidents) {
+    auto json_incident = serializeIncident(incident);
+    serialized_incidents->emplace_back(json_incident);
+  }
+  doc.emplace("incidents", serialized_incidents);
+}
+
+void serializeClosures(const valhalla::TripLeg& leg, json::Jmap& doc) {
+  if (!leg.closures_size()) {
+    return;
+  }
+  auto closures = json::array({});
+  closures->reserve(leg.closures_size());
+  for (const valhalla::TripLeg_Closure& closure : leg.closures()) {
+    auto closure_obj = json::map({});
+    closure_obj->emplace("geometry_index_start", static_cast<uint64_t>(closure.begin_shape_index()));
+    closure_obj->emplace("geometry_index_end", static_cast<uint64_t>(closure.end_shape_index()));
+    closures->emplace_back(std::move(closure_obj));
+  }
+  doc.emplace("closures", closures);
 }
 
 // Compile and return the refs of the specified list
@@ -791,21 +978,21 @@ std::string turn_modifier(const uint32_t in_brg, const uint32_t out_brg) {
   auto turn_type = Turn::GetType(turn_degree);
   switch (turn_type) {
     case baldr::Turn::Type::kStraight:
-      return "straight";
+      return osrmconstants::kModifierStraight;
     case baldr::Turn::Type::kSlightRight:
-      return "slight right";
+      return osrmconstants::kModifierSlightRight;
     case baldr::Turn::Type::kRight:
-      return "right";
+      return osrmconstants::kModifierRight;
     case baldr::Turn::Type::kSharpRight:
-      return "sharp right";
+      return osrmconstants::kModifierSharpRight;
     case baldr::Turn::Type::kReverse:
-      return "uturn";
+      return osrmconstants::kModifierUturn;
     case baldr::Turn::Type::kSharpLeft:
-      return "sharp left";
+      return osrmconstants::kModifierSharpLeft;
     case baldr::Turn::Type::kLeft:
-      return "left";
+      return osrmconstants::kModifierLeft;
     case baldr::Turn::Type::kSlightLeft:
-      return "slight left";
+      return osrmconstants::kModifierSlightLeft;
   }
   auto num = static_cast<uint32_t>(turn_type);
   throw std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) +
@@ -815,7 +1002,6 @@ std::string turn_modifier(const uint32_t in_brg, const uint32_t out_brg) {
 // Get the turn modifier based on the maneuver type
 // or if needed, the incoming edge bearing and outgoing edge bearing.
 std::string turn_modifier(const valhalla::DirectionsLeg::Maneuver& maneuver,
-                          valhalla::odin::EnhancedTripLeg* etp,
                           const uint32_t in_brg,
                           const uint32_t out_brg,
                           const bool arrive_maneuver) {
@@ -827,47 +1013,47 @@ std::string turn_modifier(const valhalla::DirectionsLeg::Maneuver& maneuver,
     case valhalla::DirectionsLeg_Maneuver_Type_kStayRight:
     case valhalla::DirectionsLeg_Maneuver_Type_kExitRight:
     case valhalla::DirectionsLeg_Maneuver_Type_kMergeRight:
-      return "slight right";
+      return osrmconstants::kModifierSlightRight;
     case valhalla::DirectionsLeg_Maneuver_Type_kRight:
     case valhalla::DirectionsLeg_Maneuver_Type_kStartRight:
     case valhalla::DirectionsLeg_Maneuver_Type_kDestinationRight:
-      return "right";
+      return osrmconstants::kModifierRight;
     case valhalla::DirectionsLeg_Maneuver_Type_kSharpRight:
-      return "sharp right";
+      return osrmconstants::kModifierSharpRight;
     case valhalla::DirectionsLeg_Maneuver_Type_kUturnRight:
     case valhalla::DirectionsLeg_Maneuver_Type_kUturnLeft:
       // [TODO #1789] route ending in uturn should not set modifier=uturn
       if (arrive_maneuver)
         return "";
-      return "uturn";
+      return osrmconstants::kModifierUturn;
     case valhalla::DirectionsLeg_Maneuver_Type_kSharpLeft:
-      return "sharp left";
+      return osrmconstants::kModifierSharpLeft;
     case valhalla::DirectionsLeg_Maneuver_Type_kLeft:
     case valhalla::DirectionsLeg_Maneuver_Type_kStartLeft:
     case valhalla::DirectionsLeg_Maneuver_Type_kDestinationLeft:
-      return "left";
+      return osrmconstants::kModifierLeft;
     case valhalla::DirectionsLeg_Maneuver_Type_kSlightLeft:
     case valhalla::DirectionsLeg_Maneuver_Type_kStayLeft:
     case valhalla::DirectionsLeg_Maneuver_Type_kExitLeft:
     case valhalla::DirectionsLeg_Maneuver_Type_kMergeLeft:
-      return "slight left";
+      return osrmconstants::kModifierSlightLeft;
     case valhalla::DirectionsLeg_Maneuver_Type_kRampRight:
       if (Turn::GetType(GetTurnDegree(in_brg, out_brg)) == baldr::Turn::Type::kRight)
-        return "right";
+        return osrmconstants::kModifierRight;
       else
-        return "slight right";
+        return osrmconstants::kModifierSlightRight;
     case valhalla::DirectionsLeg_Maneuver_Type_kRampLeft:
       if (Turn::GetType(GetTurnDegree(in_brg, out_brg)) == baldr::Turn::Type::kLeft)
-        return "left";
+        return osrmconstants::kModifierLeft;
       else
-        return "slight left";
+        return osrmconstants::kModifierSlightLeft;
     case valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutEnter:
     case valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutExit:
     case valhalla::DirectionsLeg_Maneuver_Type_kFerryEnter:
     case valhalla::DirectionsLeg_Maneuver_Type_kFerryExit:
       return turn_modifier(in_brg, out_brg);
     default:
-      return "straight";
+      return osrmconstants::kModifierStraight;
   }
 }
 
@@ -902,7 +1088,8 @@ json::MapPtr osrm_maneuver(const valhalla::DirectionsLeg::Maneuver& maneuver,
                            const std::string& mode,
                            const std::string& prev_mode,
                            const bool rotary,
-                           const bool prev_rotary) {
+                           const bool prev_rotary,
+                           const valhalla::Options& options) {
   auto osrm_man = json::map({});
 
   // Set the location
@@ -922,9 +1109,13 @@ json::MapPtr osrm_maneuver(const valhalla::DirectionsLeg::Maneuver& maneuver,
 
   std::string modifier;
   if (!depart_maneuver) {
-    modifier = turn_modifier(maneuver, etp, in_brg, out_brg, arrive_maneuver);
+    modifier = turn_modifier(maneuver, in_brg, out_brg, arrive_maneuver);
     if (!modifier.empty())
       osrm_man->emplace("modifier", modifier);
+  }
+
+  if (options.directions_type() == DirectionsType::instructions) {
+    osrm_man->emplace("instruction", maneuver.text_instruction());
   }
 
   // TODO - logic to convert maneuver types from Valhalla into OSRM maneuver types.
@@ -1024,7 +1215,7 @@ json::MapPtr osrm_maneuver(const valhalla::DirectionsLeg::Maneuver& maneuver,
       } else if (false_node && new_name) {
         maneuver_type = "new name";
       } else {
-        if ((modifier != "uturn") && (!maneuver.to_stay_on())) {
+        if ((modifier != osrmconstants::kModifierUturn) && (!maneuver.to_stay_on())) {
           maneuver_type = "turn";
         } else {
           maneuver_type = "continue";
@@ -1179,6 +1370,7 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
                               bool imperial,
                               const valhalla::Options& options) {
   auto output_legs = json::array({});
+  output_legs->reserve(path_legs.size());
 
   // Verify that the path_legs list is the same size as the legs list
   if (legs.size() != path_legs.size()) {
@@ -1190,6 +1382,7 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
   for (auto& path_leg : path_legs) {
     valhalla::odin::EnhancedTripLeg etp(path_leg);
     auto output_leg = json::map({});
+    output_leg->reserve(10);
 
     // Get the full shape for the leg. We want to use this for serializing
     // encoded shape for each step (maneuver) in OSRM output.
@@ -1211,6 +1404,7 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
     json::MapPtr prev_step;
     for (const auto& maneuver : leg->maneuver()) {
       auto step = json::map({});
+      step->reserve(15); // lots of conditional stuff here
       bool depart_maneuver = (maneuver_index == 0);
       bool arrive_maneuver = (maneuver_index == leg->maneuver_size() - 1);
 
@@ -1240,12 +1434,51 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
 
       step->emplace("mode", mode);
       step->emplace("driving_side", drive_side);
-      step->emplace("duration", json::fp_t{duration, 3});
-      step->emplace("weight", json::fp_t{duration, 3});
       step->emplace("distance", json::fp_t{distance, 3});
+      step->emplace("duration", json::fp_t{duration, 3});
+      const auto& end_node = path_leg.node(maneuver.end_path_index());
+      const auto& begin_node = path_leg.node(maneuver.begin_path_index());
+      auto weight = end_node.cost().elapsed_cost().cost() - begin_node.cost().elapsed_cost().cost();
+      step->emplace("weight", json::fp_t{weight, 3});
+      auto recost_itr = options.recostings().begin();
+      auto begin_recost_itr = begin_node.recosts().begin();
+      for (const auto& end_recost : end_node.recosts()) {
+        if (end_recost.has_elapsed_cost()) {
+          step->emplace("duration_" + recost_itr->name(),
+                        json::fp_t{end_recost.elapsed_cost().seconds() -
+                                       begin_recost_itr->elapsed_cost().seconds(),
+                                   3});
+          step->emplace("weight_" + recost_itr->name(),
+                        json::fp_t{end_recost.elapsed_cost().cost() -
+                                       begin_recost_itr->elapsed_cost().cost(),
+                                   3});
+        } else {
+          step->emplace("duration_" + recost_itr->name(), nullptr_t());
+          step->emplace("weight_" + recost_itr->name(), nullptr_t());
+        }
+        ++recost_itr;
+        ++begin_recost_itr;
+      }
+
       step->emplace("name", name);
       if (!ref.empty()) {
         step->emplace("ref", ref);
+      }
+
+      // Check if speed limits were requested
+      if (path_leg.shape_attributes().speed_limit_size() > 0) {
+        // Lookup speed limit info for this country
+        auto country_code = etp.GetCountryCode(maneuver.begin_path_index());
+        auto country = speed_limit_info.find(country_code);
+        if (country != speed_limit_info.end()) {
+          // Some countries have different speed limit sign types and speed units
+          step->emplace("speedLimitSign", country->second.first);
+          step->emplace("speedLimitUnit", country->second.second);
+        } else {
+          // Otherwise use the defaults (vienna convention style and km/h)
+          step->emplace("speedLimitSign", kSpeedLimitSignVienna);
+          step->emplace("speedLimitUnit", kSpeedLimitUnitsKph);
+        }
       }
 
       rotary = ((maneuver.type() == DirectionsLeg_Maneuver_Type_kRoundaboutEnter) &&
@@ -1258,7 +1491,7 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
       step->emplace("maneuver",
                     osrm_maneuver(maneuver, &etp, shape[maneuver.begin_shape_index()],
                                   depart_maneuver, arrive_maneuver, prev_intersection_count, mode,
-                                  prev_mode, rotary, prev_rotary));
+                                  prev_mode, rotary, prev_rotary, options));
 
       // Add destinations
       const auto& sign = maneuver.sign();
@@ -1291,22 +1524,24 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
         // Add guidance_views if not the start maneuver
         if (!depart_maneuver && (maneuver.guidance_views_size() > 0)) {
           auto guidance_views = json::array({});
+          guidance_views->reserve(maneuver.guidance_views_size());
           for (const auto& gv : maneuver.guidance_views()) {
             auto guidance_view = json::map({});
             guidance_view->emplace("data_id", gv.data_id());
-            guidance_view->emplace("type", gv.type());
+            guidance_view->emplace("type", GuidanceViewTypeToString(gv.type()));
             guidance_view->emplace("base_id", gv.base_id());
             auto overlay_ids = json::array({});
+            overlay_ids->reserve(gv.overlay_ids_size());
             for (const auto& overlay : gv.overlay_ids()) {
               overlay_ids->emplace_back(overlay);
             }
-            guidance_view->emplace("overlay_ids", overlay_ids);
+            guidance_view->emplace("overlay_ids", std::move(overlay_ids));
 
             // Append to guidance view list
-            guidance_views->emplace_back(guidance_view);
+            guidance_views->emplace_back(std::move(guidance_view));
           }
           // Add guidance views to step
-          step->emplace("guidance_views", guidance_views);
+          step->emplace("guidance_views", std::move(guidance_views));
         }
       }
 
@@ -1315,12 +1550,12 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
                     intersections(maneuver, &etp, shape, prev_intersection_count, arrive_maneuver));
 
       // Add step
-      steps->emplace_back(step);
       prev_rotary = rotary;
       prev_mode = mode;
       prev_step = step;
       prev_maneuver = &maneuver;
       maneuver_index++;
+      steps->emplace_back(std::move(step));
     } // end maneuver loop
     //#########################################################################
 
@@ -1331,11 +1566,55 @@ json::ArrayPtr serialize_legs(const google::protobuf::RepeatedPtrField<valhalla:
     output_leg->emplace("summary", summarize_leg(leg));
     output_leg->emplace("distance", json::fp_t{distance, 3});
     output_leg->emplace("duration", json::fp_t{duration, 3});
-    output_leg->emplace("weight", json::fp_t{duration, 3});
+    output_leg->emplace("weight",
+                        json::fp_t{path_leg.node().rbegin()->cost().elapsed_cost().cost(), 3});
+    auto recost_itr = options.recostings().begin();
+    for (const auto& recost : path_leg.node().rbegin()->recosts()) {
+      if (recost.has_elapsed_cost()) {
+        output_leg->emplace("duration_" + recost_itr->name(),
+                            json::fp_t{recost.elapsed_cost().seconds(), 3});
+        output_leg->emplace("weight_" + recost_itr->name(),
+                            json::fp_t{recost.elapsed_cost().cost(), 3});
+      } else {
+        output_leg->emplace("duration_" + recost_itr->name(), nullptr_t());
+        output_leg->emplace("weight_" + recost_itr->name(), nullptr_t());
+      }
+      ++recost_itr;
+    }
+
+    // Add admin country codes to leg json
+    auto admins = json::array({});
+    admins->reserve(path_leg.admin_size());
+    for (const auto& admin : path_leg.admin()) {
+      auto admin_map = json::map({});
+      if (admin.has_country_code()) {
+        admin_map->emplace("iso_3166_1", admin.country_code());
+        auto country_iso3 = iso2_to_iso3.find(admin.country_code());
+        if (country_iso3 != iso2_to_iso3.end()) {
+          admin_map->emplace("iso_3166_1_alpha3", country_iso3->second);
+        }
+      }
+      // TODO: iso_3166_2 state code
+      admins->push_back(admin_map);
+    }
+    output_leg->emplace("admins", std::move(admins));
 
     // Add steps to the leg
-    output_leg->emplace("steps", steps);
-    output_legs->emplace_back(output_leg);
+    output_leg->emplace("steps", std::move(steps));
+
+    // Add shape_attributes, if requested
+    if (path_leg.has_shape_attributes()) {
+      output_leg->emplace("annotation", serialize_annotations(path_leg));
+    }
+
+    // Add incidents to the leg
+    serializeIncidents(path_leg.incidents(), *output_leg);
+
+    // Add closures
+    serializeClosures(path_leg, *output_leg);
+
+    // Keep the leg
+    output_legs->emplace_back(std::move(output_leg));
     leg++;
   }
   return output_legs;
@@ -1369,6 +1648,7 @@ std::string serialize(valhalla::Api& api) {
 
   // Add each route
   auto routes = json::array({});
+  routes->reserve(api.trip().routes_size());
 
   // OSRM is always using metric for non narrative stuff
   bool imperial = options.units() == Options::miles;
@@ -1377,27 +1657,32 @@ std::string serialize(valhalla::Api& api) {
   for (int i = 0; i < api.trip().routes_size(); ++i) {
     // Create a route to add to the array
     auto route = json::map({});
+    route->reserve(10); // some of the things are conditional so we take a swag here
 
-    // TODO: phase 1, just hardcode score. phase 2: do real implementation
-    if (options.action() == valhalla::Options::trace_route)
+    if (options.action() == Options::trace_route) {
+      // NOTE(mookerji): confidence value here is a placeholder for future implementation.
       route->emplace("confidence", json::fp_t{1, 1});
+    }
+    // Add linear references, if applicable
+    route_references(route, api.trip().routes(i), options);
 
     // Concatenated route geometry
-    route_geometry(route, api.directions().routes(i).legs(), options);
+    route_geometry(route, api.directions().routes(i), options);
 
     // Other route summary information
-    route_summary(route, api.directions().routes(i).legs(), imperial);
+    route_summary(route, api, imperial, i);
 
     // Serialize route legs
     route->emplace("legs", serialize_legs(api.directions().routes(i).legs(),
                                           *api.mutable_trip()->mutable_routes(i)->mutable_legs(),
                                           imperial, options));
 
-    routes->emplace_back(route);
+    routes->emplace_back(std::move(route));
   }
 
   // Routes are called matchings in osrm map matching mode
-  json->emplace(options.action() == valhalla::Options::trace_route ? "matchings" : "routes", routes);
+  json->emplace(options.action() == valhalla::Options::trace_route ? "matchings" : "routes",
+                std::move(routes));
 
   std::stringstream ss;
   ss << *json;
@@ -1405,4 +1690,290 @@ std::string serialize(valhalla::Api& api) {
 }
 
 } // namespace osrm_serializers
+
+#ifdef INLINE_TEST
+
+using namespace osrm_serializers;
+
+/// Assert equality of two json documents
+//
+// TODO Improve the diffed view of mis-matching documents
+void assert_json_equality(const rapidjson::Document& doc1, const rapidjson::Document& doc2) {
+  if (doc1 != doc2) {
+    ASSERT_STREQ(rapidjson::serialize(doc1).c_str(), rapidjson::serialize(doc2).c_str());
+  }
+}
+
+TEST(RouteSerializerOsrm, testserializeIncidents) {
+  // Test that an incident is added correctly to the intersections-json
+
+  rapidjson::Document serialized_to_json;
+  {
+    auto intersection_doc = json::Jmap();
+    auto leg = TripLeg();
+    // Sets up the incident
+    auto incidents = leg.mutable_incidents();
+    auto* incident = incidents->Add();
+    incident->set_begin_shape_index(42);
+    incident->set_end_shape_index(42);
+
+    valhalla::IncidentsTile::Metadata meta;
+    meta.set_id(
+        // Set a large id that excercises the uint64 serialization
+        18446744073709551615u);
+    uint64_t creation_time = 1597241829;
+    meta.set_creation_time(creation_time);
+    meta.set_start_time(creation_time + 100);
+    meta.set_end_time(creation_time + 1800);
+    meta.set_type(valhalla::IncidentsTile::Metadata::WEATHER);
+    meta.set_impact(valhalla::IncidentsTile::Metadata::MAJOR);
+    meta.set_description("fooing foo");
+    meta.set_long_description("long fooing foo");
+    meta.set_sub_type("foo");
+    meta.set_sub_type_description("foobar");
+    meta.set_road_closed(true);
+    meta.set_num_lanes_blocked(2);
+    meta.set_clear_lanes("many lanes clear");
+    meta.mutable_congestion()->set_value(33);
+    meta.add_alertc_codes(11);
+    meta.set_iso_3166_1_alpha2("AU");
+    *incident->mutable_metadata() = meta;
+
+    // Finally call the function under test to serialize to json
+    serializeIncidents(*incidents, intersection_doc);
+
+    // Lastly, convert to rapidjson
+    std::stringstream ss;
+    ss << intersection_doc;
+    serialized_to_json.Parse(ss.str().c_str());
+  }
+
+  rapidjson::Document expected_json;
+  {
+    expected_json.Parse(R"({
+      "incidents": [
+        {
+          "id": "18446744073709551615",
+          "type": "weather",
+          "iso_3166_1_alpha2": "AU",
+          "creation_time": "2020-08-12T14:17:09Z",
+          "start_time": "2020-08-12T14:18:49Z",
+          "end_time": "2020-08-12T14:47:09Z",
+          "impact": "major",
+          "description": "fooing foo",
+          "long_description": "long fooing foo",
+          "sub_type": "foo",
+          "sub_type_description": "foobar",
+          "alertc_codes": [ 11 ],
+          "lanes_blocked": [],
+          "num_lanes_blocked": 2,
+          "clear_lanes": "many lanes clear",
+          "closed": true,
+          "congestion": {
+            "value": 33
+          },
+          "geometry_index_start": 42,
+          "geometry_index_end": 42
+        }
+      ]
+    })");
+    ASSERT_TRUE(expected_json.IsObject());
+  }
+
+  assert_json_equality(serialized_to_json, expected_json);
+}
+
+TEST(RouteSerializerOsrm, testserializeIncidentsMultipleIncidentsSingleEdge) {
+  // Test that multiple incidents on an edge are serialized correctly
+  // that only the incident-id is stored in subsequent intersections
+  // after the first
+
+  rapidjson::Document serialized_to_json;
+  {
+    auto intersection_doc = json::Jmap();
+    auto leg = TripLeg();
+    // Sets up the incident
+    auto* incidents = leg.mutable_incidents();
+    {
+      // First incident
+      auto incident = incidents->Add();
+      uint64_t creation_time = 1597241829;
+      incident->set_begin_shape_index(87);
+      incident->set_end_shape_index(92);
+
+      valhalla::IncidentsTile::Metadata meta;
+      meta.set_id(1337);
+      meta.set_description("Fooo");
+      meta.set_creation_time(creation_time);
+      meta.set_type(valhalla::IncidentsTile::Metadata::WEATHER);
+      meta.set_iso_3166_1_alpha2("SE");
+      *incident->mutable_metadata() = meta;
+    }
+    {
+      // second incident
+      auto incident = incidents->Add();
+      uint64_t creation_time = 1597241800;
+      incident->set_begin_shape_index(21);
+      incident->set_end_shape_index(104);
+
+      valhalla::IncidentsTile::Metadata meta;
+      meta.set_id(2448);
+      meta.set_creation_time(creation_time);
+      meta.set_start_time(creation_time + 100);
+      meta.set_end_time(creation_time + 1800);
+      meta.set_type(valhalla::IncidentsTile::Metadata::ACCIDENT);
+      meta.set_iso_3166_1_alpha2("SE");
+      *incident->mutable_metadata() = meta;
+    }
+
+    // Finally call the function under test to serialize to json
+    serializeIncidents(*incidents, intersection_doc);
+
+    // Lastly, convert to rapidjson
+    std::stringstream ss;
+    ss << intersection_doc;
+    serialized_to_json.Parse(ss.str().c_str());
+  }
+
+  rapidjson::Document expected_json;
+  {
+    expected_json.Parse(R"({
+      "incidents": [
+        {
+          "id": "1337",
+          "description": "Fooo",
+          "creation_time": "2020-08-12T14:17:09Z",
+          "type": "weather",
+          "iso_3166_1_alpha2": "SE",
+          "lanes_blocked": [],
+          "geometry_index_start": 87,
+          "geometry_index_end": 92
+        },
+        {
+          "id": "2448",
+          "creation_time": "2020-08-12T14:16:40Z",
+          "start_time": "2020-08-12T14:18:20Z",
+          "end_time": "2020-08-12T14:46:40Z",
+          "type": "accident",
+          "iso_3166_1_alpha2": "SE",
+          "lanes_blocked": [],
+          "geometry_index_start": 21,
+          "geometry_index_end": 104
+        }
+      ]
+    })");
+    // Ensure the json was parsed
+    ASSERT_TRUE(expected_json.IsObject());
+  }
+
+  assert_json_equality(serialized_to_json, expected_json);
+}
+
+TEST(RouteSerializerOsrm, testserializeIncidentsNothingToAdd) {
+
+  rapidjson::Document serialized_to_json;
+  {
+    auto intersection_doc = json::Jmap();
+    auto leg = TripLeg();
+
+    // Finally call the function under test to serialize to json
+    serializeIncidents(leg.incidents(), intersection_doc);
+
+    // Lastly, convert to rapidjson
+    std::stringstream ss;
+    ss << intersection_doc;
+    serialized_to_json.Parse(ss.str().c_str());
+  }
+
+  rapidjson::Document expected_json;
+  {
+    expected_json.Parse("{}");
+    ASSERT_TRUE(expected_json.IsObject());
+  }
+
+  assert_json_equality(serialized_to_json, expected_json);
+}
+
+TEST(RouteSerializerOsrm, testserializeAnnotationsEmpty) {
+  rapidjson::Document serialized_to_json;
+  {
+    auto leg = TripLeg();
+    json::MapPtr annotations = serialize_annotations(leg);
+
+    std::stringstream ss;
+    ss << *annotations;
+    serialized_to_json.Parse(ss.str().c_str());
+    std::cout << *annotations << std::endl;
+  }
+  rapidjson::Document expected_json;
+  { expected_json.Parse(R"({})"); }
+
+  assert_json_equality(serialized_to_json, expected_json);
+}
+
+TEST(RouteSerializerOsrm, testserializeAnnotations) {
+  rapidjson::Document serialized_to_json;
+  {
+    auto leg = TripLeg();
+    leg.mutable_shape_attributes()->add_time(1);
+    leg.mutable_shape_attributes()->add_length(2);
+    leg.mutable_shape_attributes()->add_speed(3);
+    auto annotations = serialize_annotations(leg);
+
+    std::stringstream ss;
+    ss << *annotations;
+    serialized_to_json.Parse(ss.str().c_str());
+  }
+  rapidjson::Document expected_json;
+  {
+    expected_json.Parse(R"({
+      "duration": [0.001],
+      "distance": [0.2],
+      "speed": [0.3]
+    })");
+    ASSERT_TRUE(expected_json.IsObject());
+  }
+
+  assert_json_equality(serialized_to_json, expected_json);
+}
+
+TEST(RouteSerializerOsrm, testserializeAnnotationsSpeedLimits) {
+  rapidjson::Document serialized_to_json;
+  {
+    auto leg = TripLeg();
+    leg.mutable_shape_attributes()->add_speed_limit(30);
+    leg.mutable_shape_attributes()->add_speed_limit(255);
+    leg.mutable_shape_attributes()->add_speed_limit(0);
+    auto annotations = serialize_annotations(leg);
+
+    std::stringstream ss;
+    ss << *annotations;
+    serialized_to_json.Parse(ss.str().c_str());
+  }
+  rapidjson::Document expected_json;
+  {
+    expected_json.Parse(R"({
+      "maxspeed": [
+        { "speed": 30, "unit": "km/h" },
+        { "none": true },
+        { "unknown": true }
+      ]
+    })");
+    ASSERT_TRUE(expected_json.IsObject());
+  }
+
+  assert_json_equality(serialized_to_json, expected_json);
+}
+
 } // namespace
+
+int main(int argc, char* argv[]) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
+
+#else
+
+} // namespace
+
+#endif

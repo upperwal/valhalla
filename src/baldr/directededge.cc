@@ -114,8 +114,13 @@ void DirectedEdge::set_sign(const bool exit) {
 // ------------------------- Geographic attributes ------------------------- //
 
 // Sets the length of the edge in meters.
-void DirectedEdge::set_length(const uint32_t length) {
+void DirectedEdge::set_length(const uint32_t length, bool should_error) {
   if (length > kMaxEdgeLength) {
+    if (should_error) {
+      // Consider this a catastrophic error.
+      LOG_ERROR("Exceeding max. edge length: " + std::to_string(length));
+      throw std::runtime_error("DirectedEdgeBuilder: exceeded maximum edge length");
+    }
     LOG_WARN("Exceeding max. edge length: " + std::to_string(length));
     length_ = kMaxEdgeLength;
   } else {
@@ -502,6 +507,8 @@ void DirectedEdge::set_shortcut(const uint32_t shortcut) {
 void DirectedEdge::set_superseded(const uint32_t superseded) {
   if (superseded > kMaxShortcutsFromNode) {
     LOG_WARN("Exceeding max shortcut edges from a node: " + std::to_string(superseded));
+  } else if (superseded == 0) {
+    superseded_ = 0;
   } else {
     superseded_ = (1 << (superseded - 1));
   }

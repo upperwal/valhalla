@@ -4,9 +4,6 @@
 #include <string>
 #include <vector>
 
-#include "baldr/rapidjson_utils.h"
-#include <boost/property_tree/ptree.hpp>
-
 #include "loki/worker.h"
 #include "midgard/logging.h"
 #include "sif/dynamiccost.h"
@@ -33,25 +30,20 @@ public:
    * Constructor.
    * @param  options Request options in a pbf
    */
-  SimpleCost(const Options& options) : DynamicCost(options, TravelMode::kDrive) {
+  SimpleCost(const CostingOptions& options) : DynamicCost(options, TravelMode::kDrive, kAutoAccess) {
   }
 
   ~SimpleCost() {
   }
 
-  uint32_t access_mode() const {
-    return kAutoAccess;
-  }
-
   bool Allowed(const DirectedEdge* edge,
                const EdgeLabel& pred,
-               const GraphTile*& tile,
+               const graph_tile_ptr& /*tile*/,
                const GraphId& edgeid,
-               const uint64_t current_time,
-               const uint32_t tz_index,
-               bool& time_restricted) const {
-    if (!(edge->forwardaccess() & kAutoAccess) ||
-        (!pred.deadend() && pred.opp_local_idx() == edge->localedgeidx()) ||
+               const uint64_t /*current_time*/,
+               const uint32_t /*tz_index*/,
+               uint8_t& /*restriction_idx*/) const override {
+    if (!IsAccessible(edge) || (!pred.deadend() && pred.opp_local_idx() == edge->localedgeidx()) ||
         (pred.restrictions() & (1 << edge->localedgeidx())) ||
         edge->surface() == Surface::kImpassable || IsUserAvoidEdge(edgeid) ||
         (!allow_destination_only_ && !pred.destonly() && edge->destonly())) {
@@ -63,12 +55,12 @@ public:
   bool AllowedReverse(const DirectedEdge* edge,
                       const EdgeLabel& pred,
                       const DirectedEdge* opp_edge,
-                      const GraphTile*& tile,
+                      const graph_tile_ptr& /*tile*/,
                       const GraphId& opp_edgeid,
-                      const uint64_t current_time,
-                      const uint32_t tz_index,
-                      bool& has_time_restrictions) const {
-    if (!(opp_edge->forwardaccess() & kAutoAccess) ||
+                      const uint64_t /*current_time*/,
+                      const uint32_t /*tz_index*/,
+                      uint8_t& /*restriction_idx*/) const override {
+    if (!IsAccessible(opp_edge) ||
         (!pred.deadend() && pred.opp_local_idx() == edge->localedgeidx()) ||
         (opp_edge->restrictions() & (1 << pred.opp_local_idx())) ||
         opp_edge->surface() == Surface::kImpassable || IsUserAvoidEdge(opp_edgeid) ||
@@ -78,70 +70,52 @@ public:
     return true;
   }
 
-  bool Allowed(const NodeInfo* node) const {
-    return (node->access() & kAutoAccess);
-  }
-
-  Cost EdgeCost(const baldr::DirectedEdge* edge,
-                const baldr::TransitDeparture* departure,
-                const uint32_t curr_time) const {
+  Cost EdgeCost(const baldr::DirectedEdge* /*edge*/,
+                const baldr::TransitDeparture* /*departure*/,
+                const uint32_t /*curr_time*/) const override {
     throw std::runtime_error("We shouldnt be testing transit edges");
   }
 
-  Cost EdgeCost(const DirectedEdge* edge, const GraphTile* tile, const uint32_t seconds) const {
+  Cost EdgeCost(const DirectedEdge* edge,
+                const graph_tile_ptr& /*tile*/,
+                const uint32_t /*seconds*/,
+                uint8_t& /*flow_sources*/) const override {
     float sec = static_cast<float>(edge->length());
     return {sec / 10.0f, sec};
   }
 
-  Cost TransitionCost(const DirectedEdge* edge, const NodeInfo* node, const EdgeLabel& pred) const {
+  Cost TransitionCost(const DirectedEdge* /*edge*/,
+                      const NodeInfo* /*node*/,
+                      const EdgeLabel& /*pred*/) const override {
     return {5.0f, 5.0f};
   }
 
-  Cost TransitionCostReverse(const uint32_t idx,
-                             const NodeInfo* node,
-                             const DirectedEdge* opp_edge,
-                             const DirectedEdge* opp_pred_edge) const {
+  Cost TransitionCostReverse(const uint32_t /*idx*/,
+                             const NodeInfo* /*node*/,
+                             const DirectedEdge* /*opp_edge*/,
+                             const DirectedEdge* /*opp_pred_edge*/,
+                             const bool /*has_measured_speed*/) const override {
     return {5.0f, 5.0f};
   }
 
-  float AStarCostFactor() const {
+  float AStarCostFactor() const override {
     return 0.1f;
   }
 
-  const EdgeFilter GetEdgeFilter() const {
-    return [](const DirectedEdge* edge) {
-      if (edge->is_shortcut() || !(edge->forwardaccess() & kAutoAccess))
-        return 0.0f;
-      else {
-        return 1.0f;
-      }
-    };
-  }
-
-  const NodeFilter GetNodeFilter() const {
-    return [](const NodeInfo* node) { return !(node->access() & kAutoAccess); };
+  bool Allowed(const baldr::DirectedEdge* edge, const graph_tile_ptr&, uint16_t) const override {
+    auto access_mask = (ignore_access_ ? kAllAccess : access_mask_);
+    bool accessible = (edge->forwardaccess() & access_mask) ||
+                      (ignore_oneways_ && (edge->reverseaccess() & access_mask));
+    if (edge->is_shortcut() || !accessible)
+      return 0.0f;
+    else {
+      return 1.0f;
+    }
   }
 };
 
-cost_ptr_t CreateSimpleCost(const Options& options) {
+cost_ptr_t CreateSimpleCost(const CostingOptions& options) {
   return std::make_shared<SimpleCost>(options);
-}
-
-boost::property_tree::ptree json_to_pt(const std::string& json) {
-  std::stringstream ss;
-  ss << json;
-  boost::property_tree::ptree pt;
-  rapidjson::read_json(ss, pt);
-  return pt;
-}
-
-rapidjson::Document to_document(const std::string& request) {
-  rapidjson::Document d;
-  auto& allocator = d.GetAllocator();
-  d.Parse(request.c_str());
-  if (d.HasParseError())
-    throw valhalla_exception_t{100};
-  return d;
 }
 
 // Maximum edge score - base this on costing type.
@@ -193,31 +167,7 @@ void adjust_scores(Options& options) {
   }
 }
 
-const auto config = json_to_pt(R"({
-    "meili": { "default": { "breakage_distance": 2000} },
-    "mjolnir":{"tile_dir":"test/data/utrecht_tiles", "concurrency": 1},
-    "loki":{
-      "actions":["sources_to_targets"],
-      "logging":{"long_request": 100},
-      "service_defaults":{"minimum_reachability": 50,"radius": 0,"search_cutoff": 35000, "node_snap_tolerance": 5, "street_side_tolerance": 5, "street_side_max_distance": 1000, "heading_tolerance": 60}
-    },
-    "service_limits": {
-      "auto": {"max_distance": 5000000.0, "max_locations": 20,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
-      "auto_shorter": {"max_distance": 5000000.0,"max_locations": 20,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
-      "bicycle": {"max_distance": 500000.0,"max_locations": 50,"max_matrix_distance": 200000.0,"max_matrix_locations": 50},
-      "bus": {"max_distance": 5000000.0,"max_locations": 50,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
-      "hov": {"max_distance": 5000000.0,"max_locations": 20,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
-      "taxi": {"max_distance": 5000000.0,"max_locations": 20,"max_matrix_distance": 400000.0,"max_matrix_locations": 50},
-      "isochrone": {"max_contours": 4,"max_distance": 25000.0,"max_locations": 1,"max_time": 120},
-      "max_avoid_locations": 50,"max_radius": 200,"max_reachability": 100,"max_alternates":2,
-      "multimodal": {"max_distance": 500000.0,"max_locations": 50,"max_matrix_distance": 0.0,"max_matrix_locations": 0},
-      "pedestrian": {"max_distance": 250000.0,"max_locations": 50,"max_matrix_distance": 200000.0,"max_matrix_locations": 50,"max_transit_walking_distance": 10000,"min_transit_walking_distance": 1},
-      "skadi": {"max_shape": 750000,"min_resample": 10.0},
-      "trace": {"max_distance": 200000.0,"max_gps_accuracy": 100.0,"max_search_radius": 100,"max_shape": 16000,"max_best_paths":4,"max_best_paths_shape":100},
-      "transit": {"max_distance": 500000.0,"max_locations": 50,"max_matrix_distance": 200000.0,"max_matrix_locations": 50},
-      "truck": {"max_distance": 5000000.0,"max_locations": 20,"max_matrix_distance": 400000.0,"max_matrix_locations": 50}
-    }
-  })");
+const auto config = test::make_config("test/data/utrecht_tiles");
 
 const auto test_request = R"({
     "sources":[
@@ -251,10 +201,10 @@ const auto test_request_osrm = R"({
     "costing":"auto"
   }&format=osrm)";
 
-std::vector<TimeDistance> matrix_answers = {{28, 28},     {2027, 1837}, {2389, 2208}, {4164, 3839},
-                                            {1518, 1397}, {1809, 1639}, {2043, 1938}, {3946, 3641},
-                                            {2299, 2109}, {687, 637},   {0, 0},       {2809, 2623},
-                                            {5554, 5178}, {3942, 3706}, {4344, 4104}, {1815, 1679}};
+std::vector<TimeDistance> matrix_answers = {{28, 28},     {2027, 1837}, {2390, 2209}, {4163, 3838},
+                                            {1519, 1398}, {1808, 1638}, {2042, 1937}, {3944, 3639},
+                                            {2298, 2107}, {687, 637},   {0, 0},       {2808, 2623},
+                                            {5552, 5177}, {3942, 3707}, {4344, 4104}, {1815, 1680}};
 } // namespace
 
 const uint32_t kThreshold = 1;
@@ -272,12 +222,14 @@ TEST(Matrix, test_matrix) {
 
   GraphReader reader(config.get_child("mjolnir"));
 
-  cost_ptr_t costing = CreateSimpleCost(request.options());
+  sif::mode_costing_t mode_costing;
+  mode_costing[0] = CreateSimpleCost(
+      request.options().costing_options(static_cast<int>(request.options().costing())));
 
   CostMatrix cost_matrix;
-  std::vector<TimeDistance> results;
-  results = cost_matrix.SourceToTarget(request.options().sources(), request.options().targets(),
-                                       reader, &costing, TravelMode::kDrive, 400000.0);
+  std::vector<TimeDistance> results =
+      cost_matrix.SourceToTarget(request.options().sources(), request.options().targets(), reader,
+                                 mode_costing, TravelMode::kDrive, 400000.0);
   for (uint32_t i = 0; i < results.size(); ++i) {
     EXPECT_NEAR(results[i].dist, matrix_answers[i].dist, kThreshold)
         << "result " + std::to_string(i) + "'s distance is not close enough" +
@@ -290,7 +242,7 @@ TEST(Matrix, test_matrix) {
 
   TimeDistanceMatrix timedist_matrix;
   results = timedist_matrix.SourceToTarget(request.options().sources(), request.options().targets(),
-                                           reader, &costing, TravelMode::kDrive, 400000.0);
+                                           reader, mode_costing, TravelMode::kDrive, 400000.0);
   for (uint32_t i = 0; i < results.size(); ++i) {
     EXPECT_NEAR(results[i].dist, matrix_answers[i].dist, kThreshold)
         << "result " + std::to_string(i) + "'s distance is not equal to" +
@@ -314,12 +266,14 @@ TEST(Matrix, DISABLED_test_matrix_osrm) {
 
   GraphReader reader(config.get_child("mjolnir"));
 
-  cost_ptr_t costing = CreateSimpleCost(request.options());
+  sif::mode_costing_t mode_costing;
+  mode_costing[0] = CreateSimpleCost(
+      request.options().costing_options(static_cast<int>(request.options().costing())));
 
   CostMatrix cost_matrix;
   std::vector<TimeDistance> results;
   results = cost_matrix.SourceToTarget(request.options().sources(), request.options().targets(),
-                                       reader, &costing, TravelMode::kDrive, 400000.0);
+                                       reader, mode_costing, TravelMode::kDrive, 400000.0);
   for (uint32_t i = 0; i < results.size(); ++i) {
     EXPECT_EQ(results[i].dist, matrix_answers[i].dist)
         << "result " + std::to_string(i) +
@@ -332,7 +286,7 @@ TEST(Matrix, DISABLED_test_matrix_osrm) {
 
   TimeDistanceMatrix timedist_matrix;
   results = timedist_matrix.SourceToTarget(request.options().sources(), request.options().targets(),
-                                           reader, &costing, TravelMode::kDrive, 400000.0);
+                                           reader, mode_costing, TravelMode::kDrive, 400000.0);
   for (uint32_t i = 0; i < results.size(); ++i) {
     EXPECT_EQ(results[i].dist, matrix_answers[i].dist)
         << "result " + std::to_string(i) +

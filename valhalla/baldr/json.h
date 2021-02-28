@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace valhalla {
 namespace baldr {
@@ -29,9 +30,13 @@ struct fp_t {
   friend std::ostream& operator<<(std::ostream& stream, const fp_t&);
 };
 
+struct RawJSON {
+  std::string data;
+};
+
 // a variant of all the possible values to go with keys in json
-using Value =
-    boost::variant<std::string, uint64_t, int64_t, fp_t, bool, std::nullptr_t, MapPtr, ArrayPtr>;
+using Value = boost::
+    variant<std::string, uint64_t, int64_t, fp_t, bool, std::nullptr_t, MapPtr, ArrayPtr, RawJSON>;
 
 // the map value type in json
 class Jmap : public std::unordered_map<std::string, Value> {
@@ -43,10 +48,10 @@ public:
 };
 
 // the array value type in json
-class Jarray : public std::list<Value> {
+class Jarray : public std::vector<Value> {
 public:
   // just specialize vector
-  using std::list<Value>::list;
+  using std::vector<Value>::vector;
 
 protected:
   // and be able to spit out text
@@ -122,6 +127,10 @@ public:
   }
   std::ostream& operator()(std::nullptr_t) const {
     return ostream_ << "null";
+  }
+
+  std::ostream& operator()(const RawJSON& value) const {
+    return ostream_ << value.data;
   }
 
   template <class Nullable> std::ostream& operator()(const Nullable& value) const {

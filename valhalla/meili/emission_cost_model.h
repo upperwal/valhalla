@@ -2,6 +2,8 @@
 #define MMP_EMISSION_COST_MODEL_H_
 
 #include <functional>
+
+#include <valhalla/meili/config.h>
 #include <valhalla/meili/state.h>
 
 namespace valhalla {
@@ -12,8 +14,8 @@ private:
   using StateGetter = std::function<const State&(const StateId& stateid)>;
 
 public:
-  EmissionCostModel(baldr::GraphReader& graphreader, const StateContainer& container, float sigma_z)
-      : graphreader_(graphreader), container_(container), sigma_z_(sigma_z),
+  EmissionCostModel(baldr::GraphReader&, const StateContainer& container, float sigma_z)
+      : container_(container), sigma_z_(sigma_z),
         inv_double_sq_sigma_z_(1.f / (sigma_z_ * sigma_z_ * 2.f)) {
     if (sigma_z_ <= 0.f) {
       throw std::invalid_argument("Expect sigma_z to be positive");
@@ -22,8 +24,8 @@ public:
 
   EmissionCostModel(baldr::GraphReader& graphreader,
                     const StateContainer& container,
-                    const boost::property_tree::ptree& config)
-      : EmissionCostModel(graphreader, container, config.get<float>("sigma_z")) {
+                    const Config::EmissionCost& config)
+      : EmissionCostModel(graphreader, container, config.sigma_z) {
   }
 
   // given the *squared* great circle distance between a measurement and its candidate,
@@ -37,8 +39,6 @@ public:
   }
 
 private:
-  baldr::GraphReader& graphreader_;
-
   const StateContainer& container_;
 
   float sigma_z_;

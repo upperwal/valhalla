@@ -8,8 +8,8 @@
 #include <vector>
 
 #include "meili/map_matcher.h"
-
 #include "meili/match_result.h"
+#include "midgard/util.h"
 #include "thor/attributes_controller.h"
 #include "thor/map_matcher.h"
 #include "thor/route_matcher.h"
@@ -67,6 +67,9 @@ namespace thor {
  * The trace_route action takes a GPS trace and turns it into a route result.
  */
 void thor_worker_t::trace_route(Api& request) {
+  // time this whole method and save that statistic
+  auto _ = measure_scope_time(request, "thor_worker_t::trace_route");
+
   // Parse request
   parse_locations(request);
   parse_costing(request);
@@ -144,26 +147,32 @@ void thor_worker_t::trace_route(Api& request) {
 void thor_worker_t::route_match(Api& request) {
   // TODO - make sure the trace has timestamps..
   auto& options = *request.mutable_options();
-  std::vector<PathInfo> path;
-  if (RouteMatcher::FormPath(mode_costing, mode, *reader, trace, options, path)) {
-    // TODO: we dont support multileg here as it ignores location types but...
-    // if this were a time dependent match you need to propogate the date time
-    // information to each legs origin location because triplegbuilder relies on it.
-    // form path set the first one but on the subsequent legs we will need to set them
-    // by doing time offsetting like is done in route_action.cc thor_worker_t::depart_at
+  std::vector<std::vector<PathInfo>> legs;
 
-    // For now we ignore multileg complications and just make sure the searched locations
-    // get the same data information the shape informations had
-    if (options.shape(0).has_date_time())
-      options.mutable_locations(0)->set_date_time(options.shape(0).date_time());
-
-    // Form the trip path based on mode costing, origin, destination, and path edges
-    auto& leg = *request.mutable_trip()->mutable_routes()->Add()->mutable_legs()->Add();
-    thor::TripLegBuilder::Build(controller, *reader, mode_costing, path.begin(), path.end(),
-                                *options.mutable_locations()->begin(),
-                                *options.mutable_locations()->rbegin(),
-                                std::list<valhalla::Location>{}, leg, interrupt);
-  } else {
+  // if the shape walking succeeds
+  if (RouteMatcher::FormPath(mode_costing, mode, *reader, options, legs)) {
+    // the origin is the first location for sure
+    auto origin = options.mutable_shape()->begin();
+    // build each leg of the route
+    for (const auto& pleg : legs) {
+      // find the destination for this leg
+      auto dest = std::find_if(origin + 1, options.mutable_shape()->end(),
+                               [&options](const valhalla::Location& l) {
+                                 return l.type() == Location::kBreak ||
+                                        l.type() == Location::kBreakThrough ||
+                                        &l == &*options.shape().rbegin();
+                               });
+      assert(dest != options.mutable_shape()->end());
+      // Form the trip path based on mode costing, origin, destination, and path edges
+      auto& leg = *request.mutable_trip()->mutable_routes()->Add()->mutable_legs()->Add();
+      thor::TripLegBuilder::Build(options, controller, *reader, mode_costing, pleg.begin(),
+                                  pleg.end(), *origin, *dest, std::list<valhalla::Location>{}, leg,
+                                  {"edge_walk"}, interrupt);
+      // Next leg
+      origin = dest;
+    }
+  } // the shape walking failed
+  else {
     throw std::exception{};
   }
 }
@@ -203,7 +212,7 @@ thor_worker_t::map_match(Api& request) {
     // OSRM map matching format has both the match points and the route, fill out the match points
     // here Note that we only support trace_route as OSRM format so best_paths == 1
     if (options.action() == Options::trace_route && options.format() == Options::osrm) {
-      const GraphTile* tile = nullptr;
+      graph_tile_ptr tile = nullptr;
       for (int i = 0; i < result.results.size(); ++i) {
         // Get the match
         const auto& match = result.results[i];
@@ -313,10 +322,8 @@ void thor_worker_t::build_trace(
 
   // initialize the origin and destination location for route
   const meili::EdgeSegment* origin_segment = paths.front().second.front();
-  std::cout << *origin_segment << std::endl;
   const meili::MatchResult& origin_match = match_results[origin_segment->first_match_idx];
   const meili::EdgeSegment* dest_segment = paths.back().second.back();
-  std::cout << *dest_segment << std::endl;
   const meili::MatchResult& dest_match = match_results[dest_segment->last_match_idx];
   Location* origin_location = options.mutable_shape(&origin_match - &match_results.front());
   Location* destination_location = options.mutable_shape(&dest_match - &match_results.front());
@@ -332,10 +339,11 @@ void thor_worker_t::build_trace(
   // TODO: do we actually need to supply the via/through type locations?
 
   // actually build the leg and add it to the route
-  auto* leg = request.mutable_trip()->add_routes()->add_legs();
-  thor::TripLegBuilder::Build(controller, matcher->graphreader(), mode_costing, path_edges.begin(),
-                              path_edges.end(), *origin_location, *destination_location,
-                              std::list<valhalla::Location>{}, *leg, interrupt, &edge_trimming);
+  auto& leg = *request.mutable_trip()->add_routes()->add_legs();
+  thor::TripLegBuilder::Build(options, controller, matcher->graphreader(), mode_costing,
+                              path_edges.begin(), path_edges.end(), *origin_location,
+                              *destination_location, std::list<valhalla::Location>{}, leg,
+                              {"map_snap"}, interrupt, &edge_trimming);
 }
 
 void thor_worker_t::build_route(
@@ -394,26 +402,32 @@ void thor_worker_t::build_route(
       const auto* prev_segment = i > 0 ? path.second[i - 1] : nullptr;
       const auto* segment = path.second[i];
       const auto* next_segment = i < path.second.size() - 1 ? path.second[i + 1] : nullptr;
-      // if we uturn onto this edge we must trim the beginning and if we uturn off we trim the end
-      bool uturn_onto =
-          prev_segment && prev_segment->edgeid != segment->edgeid && prev_segment->target < 1.f;
-      bool uturn_off_of =
-          next_segment && segment->edgeid != next_segment->edgeid && segment->target < 1.f;
-      if (uturn_onto || uturn_off_of) {
-        edge_trimming[i] = {{uturn_onto, match_results[segment->first_match_idx].lnglat,
-                             segment->source},
-                            {uturn_off_of, match_results[segment->last_match_idx].lnglat,
-                             segment->target}};
+
+      // Note: below we use the operator[] to default initialize the "trim" boolean to false
+      // and then we overwrite it. Since its a pair this handles the case when just one is set
+
+      // if we uturn onto this edge we must trim the beginning
+      if (prev_segment && prev_segment->edgeid != segment->edgeid && prev_segment->target < 1.f &&
+          segment->first_match_idx > -1 && segment->first_match_idx < match_results.size()) {
+        edge_trimming[i].first = {true, match_results[segment->first_match_idx].lnglat,
+                                  segment->source};
+      }
+      // if we uturn off of this edge we must trim the end
+      if (next_segment && segment->edgeid != next_segment->edgeid && segment->target < 1.f &&
+          segment->last_match_idx > -1 && segment->last_match_idx < match_results.size()) {
+        edge_trimming[i].second = {true, match_results[segment->last_match_idx].lnglat,
+                                   segment->target};
       }
     }
 
     // TODO: do we actually need to supply the via/through type locations?
 
     // actually build the leg and add it to the route
-    TripLegBuilder::Build(controller, matcher->graphreader(), mode_costing, path.first.cbegin(),
-                          path.first.cend(), *origin_location, *destination_location,
-                          std::list<valhalla::Location>{}, *route->mutable_legs()->Add(), interrupt,
-                          &edge_trimming);
+    auto& leg = *route->mutable_legs()->Add();
+    TripLegBuilder::Build(options, controller, matcher->graphreader(), mode_costing,
+                          path.first.cbegin(), path.first.cend(), *origin_location,
+                          *destination_location, std::list<valhalla::Location>{}, leg, {"map_snap"},
+                          interrupt, &edge_trimming);
 
     if (path.second.back()->discontinuity) {
       ++route_index;

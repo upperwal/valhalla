@@ -33,6 +33,9 @@ public:
   PathAlgorithm() : interrupt(nullptr), has_ferry_(false), expansion_callback_() {
   }
 
+  PathAlgorithm(const PathAlgorithm&) = delete;
+  PathAlgorithm& operator=(const PathAlgorithm&) = delete;
+
   /**
    * Destructor
    */
@@ -54,9 +57,15 @@ public:
   GetBestPath(valhalla::Location& origin,
               valhalla::Location& dest,
               baldr::GraphReader& graphreader,
-              const std::shared_ptr<sif::DynamicCost>* mode_costing,
+              const sif::mode_costing_t& mode_costing,
               const sif::TravelMode mode,
               const Options& options = Options::default_instance()) = 0;
+
+  /**
+   * Returns the name of the algorithm
+   * @return the name of the algorithm
+   */
+  virtual const char* name() const = 0;
 
   /**
    * Clear the temporary information generated during path construction.
@@ -137,7 +146,7 @@ struct EdgeMetadata {
 
   inline static EdgeMetadata make(const baldr::GraphId& node,
                                   const baldr::NodeInfo* nodeinfo,
-                                  const baldr::GraphTile* tile,
+                                  const graph_tile_ptr& tile,
                                   EdgeStatus& edge_status_) {
     baldr::GraphId edge_id = {node.tileid(), node.level(), nodeinfo->edge_index()};
     EdgeStatusInfo* edge_status = edge_status_.GetPtr(edge_id, tile);
@@ -145,10 +154,19 @@ struct EdgeMetadata {
     return {directededge, edge_id, edge_status};
   }
 
-  inline void increment_pointers() {
+  inline EdgeMetadata& operator++() {
     ++edge;
     ++edge_id;
     ++edge_status;
+    return *this;
+  }
+
+  inline operator bool() const {
+    return edge;
+  }
+
+  inline bool operator!() const {
+    return !edge;
   }
 };
 

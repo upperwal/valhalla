@@ -24,87 +24,83 @@ TEST(TimeTracking, make) {
   // need to access the tiles
   baldr::GraphReader reader(map.config.get_child("mjolnir"));
 
+  // this is what the default should be, with constrained second of day
+  baldr::TimeInfo basic_ti{false, 0, 0, baldr::kConstrainedFlowSecondOfDay};
+
   // once without tz cache and once with
   for (auto* cache : std::vector<baldr::DateTime::tz_sys_info_cache_t*>{
            nullptr,
            new baldr::DateTime::tz_sys_info_cache_t,
        }) {
     // get some loki results
-    sif::CostFactory<sif::DynamicCost> factory;
-    factory.RegisterStandardCostingModels();
-    Options options;
-    options.set_costing(Costing::none_);
-    auto costing = factory.Create(options);
+    auto costing = sif::CostFactory().Create(Costing::none_);
     auto found = loki::Search({baldr::Location(map.nodes.begin()->second)}, reader, costing);
-    auto* location = options.add_locations();
-    baldr::PathLocation::toPBF(found.begin()->second, location, reader);
+    Location location;
+    baldr::PathLocation::toPBF(found.begin()->second, &location, reader);
 
     // no time
-    auto ti = baldr::TimeInfo::make(*location, reader, cache);
-    ASSERT_EQ(ti, baldr::TimeInfo{});
-    ASSERT_FALSE(location->has_date_time());
+    auto ti = baldr::TimeInfo::make(location, reader, cache);
+    ASSERT_EQ(ti, basic_ti);
+    ASSERT_FALSE(location.has_date_time());
 
     // bad timezone defaults to UTC
-    location->set_date_time("2020-04-01T12:34");
-    ti = baldr::TimeInfo::make(*location, reader, cache, 7777);
+    location.set_date_time("2020-04-01T12:34");
+    ti = baldr::TimeInfo::make(location, reader, cache, 7777);
     // zero out the part we dont care to test
     ti.local_time = 0;
     ti.second_of_week = 0;
     ti.seconds_from_now = 0;
     ti.negative_seconds_from_now = 0;
     ASSERT_EQ(ti, (baldr::TimeInfo{1, 291}));
-    ASSERT_EQ(location->date_time(), "2020-04-01T12:34");
+    ASSERT_EQ(location.date_time(), "2020-04-01T12:34");
 
     // current time (technically we could fail if the minute changes between the next 3 lines)
-    location->set_date_time("current");
-    ti = baldr::TimeInfo::make(*location, reader, cache);
+    location.set_date_time("current");
+    ti = baldr::TimeInfo::make(location, reader, cache);
     const auto* tz = dt::get_tz_db().from_index(291);
     auto now_str = dt::iso_date_time(tz);
     auto lt = dt::seconds_since_epoch(now_str, tz);
     auto sec = dt::second_of_week(lt, tz);
     ASSERT_EQ(ti, (baldr::TimeInfo{true, 291, lt, sec, 0}));
-    ASSERT_EQ(location->date_time(), now_str);
+    ASSERT_EQ(location.date_time(), now_str);
 
     // not current time but the same date time just set as a string
     now_str = dt::iso_date_time(tz);
-    location->set_date_time(now_str);
-    ti = baldr::TimeInfo::make(*location, reader, cache);
+    location.set_date_time(now_str);
+    ti = baldr::TimeInfo::make(location, reader, cache);
     lt = dt::seconds_since_epoch(now_str, dt::get_tz_db().from_index(1));
     sec = dt::second_of_week(lt, tz);
     ASSERT_EQ(ti, (baldr::TimeInfo{true, 291, lt, sec, 0}));
-    ASSERT_EQ(location->date_time(), now_str);
+    ASSERT_EQ(location.date_time(), now_str);
 
     // offset the time from now a bit
     now_str = dt::iso_date_time(tz);
-    auto minutes = std::atoi(now_str.substr(now_str.size() - 2, 2).c_str());
-    int offset = 7;
-    if (minutes + offset > 60)
-      offset = -offset;
+    int minutes = std::atoi(now_str.substr(now_str.size() - 2, 2).c_str());
+    int offset = minutes > 52 ? -7 : 7;
     now_str = now_str.substr(0, now_str.size() - 2) + (minutes + offset < 10 ? "0" : "") +
               std::to_string(minutes + offset);
-    location->set_date_time(now_str);
-    ti = baldr::TimeInfo::make(*location, reader, cache);
+    location.set_date_time(now_str);
+    ti = baldr::TimeInfo::make(location, reader, cache);
     lt = dt::seconds_since_epoch(now_str, tz);
     sec = dt::second_of_week(lt, tz);
     ASSERT_EQ(ti, (baldr::TimeInfo{true, 291, lt, sec, static_cast<uint64_t>(std::abs(offset * 60)),
                                    offset < 0}));
-    ASSERT_EQ(location->date_time(), now_str);
+    ASSERT_EQ(location.date_time(), now_str);
 
     // messed up date time
-    location->set_date_time("4000BC");
-    ti = baldr::TimeInfo::make(*location, reader, cache);
-    ASSERT_EQ(ti, baldr::TimeInfo{});
-    ASSERT_EQ(location->date_time(), "4000BC");
+    location.set_date_time("4000BC");
+    ti = baldr::TimeInfo::make(location, reader, cache);
+    ASSERT_EQ(ti, basic_ti);
+    ASSERT_EQ(location.date_time(), "4000BC");
 
     // user specified date time
-    location->set_date_time("2020-03-31T11:16");
-    ti =
-        baldr::TimeInfo::make(*location, reader, cache, dt::get_tz_db().to_index("America/New_York"));
+    location.set_date_time("2020-03-31T11:16");
+    ti = baldr::TimeInfo::make(location, reader, cache, dt::get_tz_db().to_index("America/New_York"));
     // zero out the part we dont care to test
     ti.seconds_from_now = 0;
     ti.negative_seconds_from_now = 0;
     ASSERT_EQ(ti, (baldr::TimeInfo{1, 110, 1585667787, 213387}));
-    ASSERT_EQ(location->date_time(), "2020-03-31T11:16");
+    ASSERT_EQ(location.date_time(), "2020-03-31T11:16");
   }
 }
 
@@ -197,7 +193,7 @@ TEST(TimeTracking, routes) {
   // pick out a start and end ll by finding the appropriate edges in the graph
   baldr::GraphReader reader(map.config.get_child("mjolnir"));
   auto opp_start_edge = gurka::findEdge(reader, map.nodes, "AB", "B");
-  const baldr::GraphTile* tile = nullptr;
+  graph_tile_ptr tile;
   const auto* node = reader.nodeinfo(std::get<3>(opp_start_edge)->endnode(), tile);
   auto start = node->latlng(tile->header()->base_ll());
   auto end_edge = gurka::findEdge(reader, map.nodes, "GH", "H");
@@ -218,11 +214,12 @@ TEST(TimeTracking, routes) {
   for (const auto& route : api.trip().routes()) {
     for (const auto& leg : route.legs()) {
       for (const auto& node : leg.node()) {
-        times.push_back(node.elapsed_time());
+        times.push_back(node.cost().elapsed_cost().seconds());
       }
     }
   }
-  std::vector<double> expected = {0, 17.1429, 34.2857, 176.789, 220.289, 244.289, 268.289};
+  std::vector<double> expected = {0,        17.1429,  34.2857,  51.4286,
+                                  193.9319, 245.4273, 269.4273, 293.4273};
   ASSERT_EQ(times.size(), expected.size());
   ASSERT_TRUE(std::equal(times.begin(), times.end(), expected.begin(), expected.end(),
                          [](double a, double b) { return std::abs(a - b) < .0001; }));
@@ -239,11 +236,11 @@ TEST(TimeTracking, routes) {
   for (const auto& route : api.trip().routes()) {
     for (const auto& leg : route.legs()) {
       for (const auto& node : leg.node()) {
-        times.push_back(node.elapsed_time());
+        times.push_back(node.cost().elapsed_cost().seconds());
       }
     }
   }
-  expected = {0, 17.1429, 34.2857, 176.789, 220.289, 244.289, 268.289};
+  expected = {0, 17.1429, 34.2857, 51.4286, 193.9319, 245.4273, 269.4273, 293.4273};
   ASSERT_EQ(times.size(), expected.size());
   ASSERT_TRUE(std::equal(times.begin(), times.end(), expected.begin(), expected.end(),
                          [](double a, double b) { return std::abs(a - b) < .0001; }));
@@ -260,13 +257,22 @@ TEST(TimeTracking, routes) {
   for (const auto& route : api.trip().routes()) {
     for (const auto& leg : route.legs()) {
       for (const auto& node : leg.node()) {
-        times.push_back(node.elapsed_time());
+        times.push_back(node.cost().elapsed_cost().seconds());
       }
     }
   }
+
   // TODO: why does arrive by have an extra node in here...
-  expected = {0, 0, 17.1429, 34.2857, 176.789, 220.289, 244.289, 268.289};
+  expected = {0, 0, 44.6402, 61.7830, 78.9259, 221.4292, 272.9246, 296.9246, 320.9246};
   ASSERT_EQ(times.size(), expected.size());
   ASSERT_TRUE(std::equal(times.begin(), times.end(), expected.begin(), expected.end(),
                          [](double a, double b) { return std::abs(a - b) < .0001; }));
+}
+
+TEST(TimeTracking, dst) {
+  // BST and GMT ambiguity where we gain an hour due to DST
+  std::string date_time = "2020-10-25T01:57";
+  int tz_idx = dt::get_tz_db().to_index("Europe/London");
+  EXPECT_NO_THROW(baldr::TimeInfo::make(date_time, tz_idx))
+      << " could not apply timezone to local time";
 }

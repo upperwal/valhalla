@@ -232,7 +232,6 @@ protected:
 
   std::string
   FormVerbalAlertKeepToStayOnInstruction(Maneuver& maneuver,
-                                         bool limit_by_consecutive_count = kLimitByConseuctiveCount,
                                          uint32_t element_max_count = kVerbalAlertElementMaxCount,
                                          const std::string& delim = kVerbalDelim);
 
@@ -246,7 +245,7 @@ protected:
                                                 const std::string& relative_dir,
                                                 const std::string& street_name,
                                                 const std::string& exit_number_sign = "",
-                                                const std::string& exit_toward_sign = "");
+                                                const std::string& toward_sign = "");
 
   /////////////////////////////////////////////////////////////////////////////
   std::string FormMergeInstruction(Maneuver& maneuver,
@@ -558,11 +557,24 @@ protected:
    */
   bool IsWithinVerbalMultiCueBounds(Maneuver& maneuver);
 
+  std::string FormBssManeuverType(DirectionsLeg_Maneuver_BssManeuverType);
   /**
    * Combines a simple preposition and a definite article for certain languages.
    */
   virtual void FormArticulatedPrepositions(std::string& instruction) {
   }
+
+  /**
+   * If begin_street_names exist, assign begin_street_names to street_names and clear the
+   * begin_street_names.
+   *
+   * @param maneuver The current maneuver to process.
+   * @param begin_street_names The begin street names string.
+   * @param street_names The street names string.
+   */
+  void UpdateObviousManeuverStreetNames(Maneuver& maneuver,
+                                        std::string& begin_street_names,
+                                        std::string& street_names);
 
   /////////////////////////////////////////////////////////////////////////////
   const Options& options_;

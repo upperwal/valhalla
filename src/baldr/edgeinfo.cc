@@ -32,11 +32,8 @@ namespace baldr {
 EdgeInfo::EdgeInfo(char* ptr, const char* names_list, const size_t names_list_length)
     : names_list_(names_list), names_list_length_(names_list_length) {
 
-  w0_.value_ = *(reinterpret_cast<uint64_t*>(ptr));
-  ptr += sizeof(uint64_t);
-
-  item_ = reinterpret_cast<PackedItem*>(ptr);
-  ptr += sizeof(PackedItem);
+  ei_ = *reinterpret_cast<EdgeInfoInner*>(ptr);
+  ptr += sizeof(EdgeInfoInner);
 
   // Set name info list pointer
   name_info_list_ = reinterpret_cast<NameInfo*>(ptr);
@@ -45,6 +42,17 @@ EdgeInfo::EdgeInfo(char* ptr, const char* names_list, const size_t names_list_le
   // Set encoded_shape_ pointer
   encoded_shape_ = ptr;
   ptr += (encoded_shape_size() * sizeof(char));
+
+  // Optional second half of 64bit way id
+  extended_wayid2_ = extended_wayid3_ = 0;
+  if (ei_.extended_wayid_size_ > 0) {
+    extended_wayid2_ = static_cast<uint8_t>(*ptr);
+    ptr += sizeof(uint8_t);
+  }
+  if (ei_.extended_wayid_size_ > 1) {
+    extended_wayid3_ = static_cast<uint8_t>(*ptr);
+    ptr += sizeof(uint8_t);
+  }
 }
 
 EdgeInfo::~EdgeInfo() {
@@ -54,7 +62,7 @@ EdgeInfo::~EdgeInfo() {
 
 // Get the name info for the specified name index.
 NameInfo EdgeInfo::GetNameInfo(uint8_t index) const {
-  if (index < item_->name_count) {
+  if (index < ei_.name_count_) {
     return name_info_list_[index];
   } else {
     throw std::runtime_error("StreetNameOffset index was out of bounds");
@@ -62,14 +70,13 @@ NameInfo EdgeInfo::GetNameInfo(uint8_t index) const {
 }
 
 // Get a list of names
-std::vector<std::string> EdgeInfo::GetNames() const {
+std::vector<std::string> EdgeInfo::GetNames(bool only_tagged_names) const {
   // Get each name
   std::vector<std::string> names;
   names.reserve(name_count());
   const NameInfo* ni = name_info_list_;
   for (uint32_t i = 0; i < name_count(); i++, ni++) {
-    // Skip any tagged names (FUTURE code may make use of them)
-    if (ni->tagged_) {
+    if ((only_tagged_names && !ni->tagged_) || (!only_tagged_names && ni->tagged_)) {
       continue;
     }
     if (ni->name_offset_ < names_list_length_) {
@@ -82,20 +89,62 @@ std::vector<std::string> EdgeInfo::GetNames() const {
 }
 
 // Get a list of names
-std::vector<std::pair<std::string, bool>> EdgeInfo::GetNamesAndTypes() const {
+std::vector<std::pair<std::string, bool>>
+EdgeInfo::GetNamesAndTypes(bool include_tagged_names) const {
   // Get each name
   std::vector<std::pair<std::string, bool>> name_type_pairs;
   name_type_pairs.reserve(name_count());
   const NameInfo* ni = name_info_list_;
   for (uint32_t i = 0; i < name_count(); i++, ni++) {
     // Skip any tagged names (FUTURE code may make use of them)
-    if (ni->tagged_) {
+    if (ni->tagged_ && !include_tagged_names) {
       continue;
     }
-    if (ni->name_offset_ < names_list_length_) {
+    if (ni->tagged_) {
+      if (ni->name_offset_ < names_list_length_) {
+        std::string name = names_list_ + ni->name_offset_;
+        if (name.size() > 1) {
+          try {
+            name_type_pairs.push_back({name.substr(1), false});
+          } catch (const std::invalid_argument& arg) {
+            LOG_DEBUG("invalid_argument thrown for name: " + name);
+          }
+        }
+      } else
+        throw std::runtime_error("GetNamesAndTypes: offset exceeds size of text list");
+    } else if (ni->name_offset_ < names_list_length_) {
       name_type_pairs.push_back({names_list_ + ni->name_offset_, ni->is_route_num_});
     } else {
       throw std::runtime_error("GetNamesAndTypes: offset exceeds size of text list");
+    }
+  }
+  return name_type_pairs;
+}
+
+// Get a list of tagged names
+std::vector<std::pair<std::string, uint8_t>> EdgeInfo::GetTaggedNamesAndTypes() const {
+  // Get each name
+  std::vector<std::pair<std::string, uint8_t>> name_type_pairs;
+  name_type_pairs.reserve(name_count());
+  const NameInfo* ni = name_info_list_;
+  for (uint32_t i = 0; i < name_count(); i++, ni++) {
+    // Skip any non tagged names
+    if (ni->tagged_) {
+      if (ni->name_offset_ < names_list_length_) {
+        std::string name = names_list_ + ni->name_offset_;
+        if (name.size() > 1) {
+          uint8_t num = 0;
+          try {
+            num = std::stoi(name.substr(0, 1));
+            name_type_pairs.push_back({name.substr(1), num});
+
+          } catch (const std::invalid_argument& arg) {
+            LOG_DEBUG("invalid_argument thrown for name: " + name);
+          }
+        }
+      } else {
+        throw std::runtime_error("GetTaggedNamesAndTypes: offset exceeds size of text list");
+      }
     }
   }
   return name_type_pairs;
@@ -113,11 +162,11 @@ uint16_t EdgeInfo::GetTypes() const {
 }
 
 // Returns shape as a vector of PointLL
+// TODO: use shared ptr here so that we dont have to worry about lifetime
 const std::vector<midgard::PointLL>& EdgeInfo::shape() const {
   // if we haven't yet decoded the shape, do so
   if (encoded_shape_ != nullptr && shape_.empty()) {
-    shape_ =
-        midgard::decode7<std::vector<midgard::PointLL>>(encoded_shape_, item_->encoded_shape_size);
+    shape_ = midgard::decode7<std::vector<midgard::PointLL>>(encoded_shape_, ei_.encoded_shape_size_);
   }
   return shape_;
 }
@@ -125,7 +174,7 @@ const std::vector<midgard::PointLL>& EdgeInfo::shape() const {
 // Returns the encoded shape string
 std::string EdgeInfo::encoded_shape() const {
   return encoded_shape_ == nullptr ? midgard::encode7(shape_)
-                                   : std::string(encoded_shape_, item_->encoded_shape_size);
+                                   : std::string(encoded_shape_, ei_.encoded_shape_size_);
 }
 
 json::MapPtr EdgeInfo::json() const {
